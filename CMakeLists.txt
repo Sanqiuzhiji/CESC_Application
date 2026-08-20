@@ -45,6 +45,9 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Application/Src/application.c
+    Application/Src/angle_sensor.c
+    Application/Src/as5600.c
+    Application/Src/cesc_commands.c
     Application/Src/firmware_update.c
     Application/Src/vesc_crc.c
     Application/Src/vesc_protocol.c
