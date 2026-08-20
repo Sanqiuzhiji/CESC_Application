@@ -9,7 +9,8 @@ in `Core` and `USB_DEVICE`; changes there should stay inside `USER CODE` blocks.
 Application/
 |-- App/                         Product lifecycle and module orchestration
 |-- Communication/
-|   `-- Vesc/                    Framing, CRC, and CESC command handling
+|   |-- Cesc/                    CESC Protocol V1, CRC, and service dispatch
+|   `-- Usb/                     Serialized USB CDC transport
 |-- Devices/
 |   `-- AngleSensor/             Angle-sensor facade and AS5600 driver
 |-- Services/
@@ -26,7 +27,7 @@ file types.
 
 ```text
 CubeMX entry points -> App -> Communication / Devices
-Communication/Vesc  -> Devices/AngleSensor / Services/FirmwareUpdate
+Communication/Cesc  -> Devices/AngleSensor / Services/FirmwareUpdate
 Devices/AngleSensor -> STM32 HAL I2C
 Services            -> STM32 HAL / USB device stack
 ```

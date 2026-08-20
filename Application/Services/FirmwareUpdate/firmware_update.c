@@ -18,6 +18,15 @@ enum {
   NVIC_REGISTER_COUNT = 8U
 };
 
+enum {
+  BOOTLOADER_HEADER_SIZE = 6U
+};
+
+static uint32_t update_size;
+static uint32_t update_next_offset;
+static uint32_t update_expected_crc32;
+static bool update_active;
+
 static const uint32_t staging_sectors[] = {
   FLASH_SECTOR_8, FLASH_SECTOR_9, FLASH_SECTOR_10
 };
@@ -133,6 +142,144 @@ bool firmware_update_write(uint32_t offset, const uint8_t *data, uint32_t length
   }
   return succeeded;
 }
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data,
+                             uint32_t length)
+{
+  while (length-- > 0U)
+  {
+    crc ^= *data++;
+    for (uint32_t bit = 0U; bit < 8U; ++bit)
+    {
+      crc = (crc >> 1U) ^ ((crc & 1U) != 0U ? 0xEDB88320UL : 0U);
+    }
+  }
+  return crc;
+}
+
+static uint16_t crc16_update(uint16_t crc, uint8_t value)
+{
+  crc ^= (uint16_t)value << 8U;
+  for (uint32_t bit = 0U; bit < 8U; ++bit)
+  {
+    crc = (uint16_t)((crc << 1U) ^
+                     ((crc & 0x8000U) != 0U ? 0x1021U : 0U));
+  }
+  return crc;
+}
+
+bool firmware_update_begin(uint32_t image_size, uint32_t image_crc32)
+{
+  if ((image_size == 0U) ||
+      (image_size > (STAGING_SIZE - BOOTLOADER_HEADER_SIZE)))
+  {
+    return false;
+  }
+  if (!firmware_update_erase(image_size + BOOTLOADER_HEADER_SIZE))
+  {
+    return false;
+  }
+  update_size = image_size;
+  update_next_offset = 0U;
+  update_expected_crc32 = image_crc32;
+  update_active = true;
+  return true;
+}
+
+bool firmware_update_write_block(uint32_t offset, const uint8_t *data,
+                                 uint32_t length)
+{
+  if (!update_active || (data == NULL) || (length == 0U) ||
+      (offset > update_size) || (length > (update_size - offset)))
+  {
+    return false;
+  }
+
+  if (offset < update_next_offset)
+  {
+    if ((offset + length) > update_next_offset)
+    {
+      return false;
+    }
+    for (uint32_t index = 0U; index < length; ++index)
+    {
+      if (*(const uint8_t *)(STAGING_ADDRESS + BOOTLOADER_HEADER_SIZE +
+                             offset + index) != data[index])
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (offset != update_next_offset)
+  {
+    return false;
+  }
+  if (!firmware_update_write(BOOTLOADER_HEADER_SIZE + offset, data, length))
+  {
+    return false;
+  }
+  update_next_offset += length;
+  return true;
+}
+
+bool firmware_update_finish(uint32_t *calculated_crc32)
+{
+  uint32_t crc32 = 0xFFFFFFFFUL;
+  uint16_t crc16 = 0U;
+  uint8_t header[BOOTLOADER_HEADER_SIZE];
+
+  if (!update_active || (update_next_offset != update_size))
+  {
+    return false;
+  }
+  for (uint32_t index = 0U; index < update_size; ++index)
+  {
+    const uint8_t value = *(const uint8_t *)(STAGING_ADDRESS +
+                                             BOOTLOADER_HEADER_SIZE + index);
+    crc32 = crc32_update(crc32, &value, 1U);
+    crc16 = crc16_update(crc16, value);
+  }
+  crc32 ^= 0xFFFFFFFFUL;
+  if (calculated_crc32 != NULL)
+  {
+    *calculated_crc32 = crc32;
+  }
+  if (crc32 != update_expected_crc32)
+  {
+    return false;
+  }
+
+  header[0] = (uint8_t)(update_size >> 24U);
+  header[1] = (uint8_t)(update_size >> 16U);
+  header[2] = (uint8_t)(update_size >> 8U);
+  header[3] = (uint8_t)update_size;
+  header[4] = (uint8_t)(crc16 >> 8U);
+  header[5] = (uint8_t)crc16;
+  if (!firmware_update_write(0U, header, sizeof(header)))
+  {
+    return false;
+  }
+  update_active = false;
+  return true;
+}
+
+void firmware_update_abort(void)
+{
+  if (update_size != 0U)
+  {
+    /* Erasing sector 8 invalidates a header written by a completed FINISH. */
+    (void)firmware_update_erase(1U);
+  }
+  update_active = false;
+  update_size = 0U;
+  update_next_offset = 0U;
+  update_expected_crc32 = 0U;
+}
+
+uint32_t firmware_update_size(void) { return update_size; }
+uint32_t firmware_update_next_offset(void) { return update_next_offset; }
+uint32_t firmware_update_expected_crc32(void) { return update_expected_crc32; }
 
 void firmware_update_jump_to_bootloader(void)
 {

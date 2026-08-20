@@ -1,4 +1,4 @@
-#include "vesc_crc.h"
+#include "cesc_crc.h"
 
 enum {
   CRC16_POLYNOMIAL = 0x1021U,
@@ -6,7 +6,7 @@ enum {
   BITS_PER_BYTE = 8U
 };
 
-uint16_t vesc_crc16(const uint8_t *data, uint32_t length)
+uint16_t cesc_crc16(const uint8_t *data, uint32_t length)
 {
   uint16_t crc = 0U;
 
