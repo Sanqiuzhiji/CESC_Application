@@ -5,8 +5,11 @@
 
 #include "angle_sensor.h"
 #include "main.h"
-#include "usbd_cdc_if.h"
+#include "cmsis_os2.h"
+#include "usb_cdc_transport.h"
 #include "vesc_protocol.h"
+
+extern osSemaphoreId_t usbRxSemaphoreHandle;
 
 enum {
   HEARTBEAT_PERIOD_MS = 1200U,
@@ -55,16 +58,27 @@ static void print_angle_sample(void)
                     (unsigned long)(centidegrees / 100U),
                     (unsigned long)(centidegrees % 100U));
   if ((length > 0) && ((size_t)length < sizeof(angle_print_buffer))) {
-    (void)CDC_Transmit_FS((uint8_t *)angle_print_buffer, (uint16_t)length);
+    (void)usb_cdc_transport_send((uint8_t *)angle_print_buffer,
+                                 (uint16_t)length);
   }
 }
 
 void application_init(void)
 {
   vesc_protocol_init();
-  (void)angle_sensor_init();
   heartbeat_started_at = HAL_GetTick();
   last_angle_print_ms = heartbeat_started_at;
+}
+
+void application_protocol_process(void)
+{
+  vesc_protocol_process();
+}
+
+void application_status_process(void)
+{
+  print_angle_sample();
+  update_heartbeat();
 }
 
 void application_process(void)
@@ -78,4 +92,7 @@ void application_process(void)
 void application_usb_receive(const uint8_t *data, uint32_t length)
 {
   vesc_protocol_receive(data, length);
+  if (osKernelGetState() == osKernelRunning) {
+    (void)osSemaphoreRelease(usbRxSemaphoreHandle);
+  }
 }

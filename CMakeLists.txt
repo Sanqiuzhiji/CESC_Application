@@ -45,6 +45,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Application/App/application.c
+    Application/App/application_tasks.c
+    Application/Communication/Usb/usb_cdc_transport.c
     Application/Communication/Vesc/cesc_commands.c
     Application/Communication/Vesc/vesc_crc.c
     Application/Communication/Vesc/vesc_protocol.c
@@ -57,6 +59,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Application/App
     Application/Communication/Vesc
+    Application/Communication/Usb
     Application/Devices/AngleSensor
     Application/Services/FirmwareUpdate
 )

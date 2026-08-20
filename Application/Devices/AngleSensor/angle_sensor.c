@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "as5600.h"
+#include "cmsis_os2.h"
 #include "i2c.h"
 #include "main.h"
 
@@ -17,7 +18,20 @@ static as5600_t sensor;
 static angle_sensor_sample_t latest_sample;
 static uint32_t last_poll_ms;
 static uint32_t last_diagnostic_ms;
-static bool sample_valid;
+static volatile bool sample_valid;
+static volatile uint32_t sample_sequence;
+
+static void delay_ms(uint32_t milliseconds)
+{
+    if (osKernelGetState() == osKernelRunning)
+    {
+        (void)osDelay(milliseconds);
+    }
+    else
+    {
+        HAL_Delay(milliseconds);
+    }
+}
 
 static void recover_i2c_bus(I2C_HandleTypeDef* i2c)
 {
@@ -33,22 +47,22 @@ static void recover_i2c_bus(I2C_HandleTypeDef* i2c)
     HAL_GPIO_Init(GPIOB, &gpio);
 
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10 | GPIO_PIN_11, GPIO_PIN_SET);
-    HAL_Delay(1U);
+    delay_ms(1U);
     for (uint32_t pulse = 0U; pulse < 9U; ++pulse)
     {
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
-        HAL_Delay(1U);
+        delay_ms(1U);
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
-        HAL_Delay(1U);
+        delay_ms(1U);
     }
 
     /* Generate STOP: SDA low-to-high while SCL is high. */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
-    HAL_Delay(1U);
+    delay_ms(1U);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
-    HAL_Delay(1U);
+    delay_ms(1U);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
-    HAL_Delay(1U);
+    delay_ms(1U);
 
     __HAL_RCC_I2C2_FORCE_RESET();
     __HAL_RCC_I2C2_RELEASE_RESET();
@@ -107,6 +121,7 @@ bool angle_sensor_init(void)
 
     latest_sample.status = ANGLE_SENSOR_STATUS_UNINITIALIZED;
     sample_valid = false;
+    sample_sequence = 0U;
     last_poll_ms = now;
     last_diagnostic_ms = now;
 
@@ -133,10 +148,16 @@ void angle_sensor_process(void)
 
     if (!as5600_read_raw(&sensor, &raw))
     {
+        ++sample_sequence;
+        __DMB();
         latest_sample.status = ANGLE_SENSOR_STATUS_IO_ERROR;
+        __DMB();
+        ++sample_sequence;
         return;
     }
 
+    ++sample_sequence;
+    __DMB();
     latest_sample.raw = raw;
     latest_sample.degrees = (float)raw * (360.0F / 4096.0F);
     latest_sample.timestamp_ms = now;
@@ -149,6 +170,8 @@ void angle_sensor_process(void)
         latest_sample.status =
             map_magnet_status(as5600_read_magnet_status(&sensor));
     }
+    __DMB();
+    ++sample_sequence;
 }
 
 bool angle_sensor_get_sample(angle_sensor_sample_t* sample)
@@ -157,31 +180,61 @@ bool angle_sensor_get_sample(angle_sensor_sample_t* sample)
     {
         return false;
     }
-    *sample = latest_sample;
-    return true;
+    uint32_t sequence_before;
+    uint32_t sequence_after;
+
+    for (;;)
+    {
+        sequence_before = sample_sequence;
+        if ((sequence_before & 1U) != 0U)
+        {
+            continue;
+        }
+        __DMB();
+        *sample = latest_sample;
+        __DMB();
+        sequence_after = sample_sequence;
+        if ((sequence_before == sequence_after) &&
+            ((sequence_after & 1U) == 0U))
+        {
+            break;
+        }
+    }
+
+    return sample_valid;
 }
 
 bool angle_sensor_read_degrees(float* degrees)
 {
-    if ((degrees == NULL) || !sample_valid)
+    angle_sensor_sample_t sample;
+
+    if ((degrees == NULL) || !angle_sensor_get_sample(&sample))
     {
         return false;
     }
-    *degrees = latest_sample.degrees;
+    *degrees = sample.degrees;
     return true;
 }
 
 bool angle_sensor_read_raw(uint16_t* raw)
 {
-    if ((raw == NULL) || !sample_valid)
+    angle_sensor_sample_t sample;
+
+    if ((raw == NULL) || !angle_sensor_get_sample(&sample))
     {
         return false;
     }
-    *raw = latest_sample.raw;
+    *raw = sample.raw;
     return true;
 }
 
 angle_sensor_status_t angle_sensor_get_status(void)
 {
-    return latest_sample.status;
+    angle_sensor_sample_t sample;
+
+    if (!angle_sensor_get_sample(&sample))
+    {
+        return latest_sample.status;
+    }
+    return sample.status;
 }

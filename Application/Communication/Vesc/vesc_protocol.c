@@ -5,7 +5,8 @@
 
 #include "cesc_commands.h"
 #include "firmware_update.h"
-#include "usbd_cdc_if.h"
+#include "main.h"
+#include "usb_cdc_transport.h"
 #include "vesc_crc.h"
 
 enum
@@ -80,7 +81,7 @@ static void send_frame(const uint8_t* payload, uint16_t length)
     tx_buffer[write_index++] = (uint8_t)crc;
     tx_buffer[write_index++] = FRAME_END_MARKER;
 
-    (void)CDC_Transmit_FS(tx_buffer, write_index);
+    (void)usb_cdc_transport_send(tx_buffer, write_index);
 }
 
 static void send_update_result(command_id_t command, bool succeeded)
