@@ -44,18 +44,21 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    Application/Src/application.c
-    Application/Src/angle_sensor.c
-    Application/Src/as5600.c
-    Application/Src/cesc_commands.c
-    Application/Src/firmware_update.c
-    Application/Src/vesc_crc.c
-    Application/Src/vesc_protocol.c
+    Application/App/application.c
+    Application/Communication/Vesc/cesc_commands.c
+    Application/Communication/Vesc/vesc_crc.c
+    Application/Communication/Vesc/vesc_protocol.c
+    Application/Devices/AngleSensor/angle_sensor.c
+    Application/Devices/AngleSensor/as5600.c
+    Application/Services/FirmwareUpdate/firmware_update.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    Application/Inc
+    Application/App
+    Application/Communication/Vesc
+    Application/Devices/AngleSensor
+    Application/Services/FirmwareUpdate
 )
 
 # Add project symbols (macros)

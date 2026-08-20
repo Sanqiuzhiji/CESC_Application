@@ -53,5 +53,6 @@ Select `CESC_Application.bin` as a custom firmware image. Compression support
 is owned by the separate CESC_Bootloader project.
 
 During download PB0 indicates staging Flash activity. PB1 indicates an erase
-or write error. LED polarity can be changed in `Application/Src/firmware_update.c` if the board
+or write error. LED polarity can be changed in
+`Application/Services/FirmwareUpdate/firmware_update.c` if the board
 uses active-low LEDs.
