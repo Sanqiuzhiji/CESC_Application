@@ -75,7 +75,8 @@ enum {
     FIRMWARE_IDLE = 0,
     FIRMWARE_RECEIVING = 2,
     FIRMWARE_READY = 4,
-    FIRMWARE_FAILED = 5
+    FIRMWARE_FAILED = 5,
+    TX_SEND_ATTEMPTS = 2
 };
 
 typedef struct {
@@ -216,13 +217,20 @@ static bool transmit_frame(uint8_t *frame, uint16_t capacity,
     }
     crc = cesc_crc16(&frame[2], (uint32_t)(8U + payload_length));
     write_u16(&frame[HEADER_SIZE + payload_length], crc);
-    if (!usb_cdc_transport_send(frame, frame_length))
+    for (uint32_t attempt = 0U; attempt < TX_SEND_ATTEMPTS; ++attempt)
     {
-        ++stats.transmit_overflows;
-        return false;
+        if (usb_cdc_transport_send(frame, frame_length))
+        {
+            stats.transmitted_bytes += frame_length;
+            return true;
+        }
+        if ((attempt + 1U) < TX_SEND_ATTEMPTS)
+        {
+            (void)osDelay(2U);
+        }
     }
-    stats.transmitted_bytes += frame_length;
-    return true;
+    ++stats.transmit_overflows;
+    return false;
 }
 
 static void send_response(uint8_t service, uint8_t command, uint16_t sequence,

@@ -6,7 +6,8 @@
 #include "usbd_cdc_if.h"
 
 enum {
-    USB_TX_READY_TIMEOUT_MS = 100U,
+    USB_TX_MUTEX_TIMEOUT_MS = 100U,
+    USB_TX_SUBMIT_TIMEOUT_MS = 250U,
     USB_TX_COMPLETE_TIMEOUT_MS = 100U
 };
 
@@ -37,17 +38,28 @@ static bool wait_for_tx_idle(uint32_t timeout_ms)
 bool usb_cdc_transport_send(uint8_t *data, uint16_t length)
 {
     bool succeeded = false;
+    const uint32_t started_at = osKernelGetTickCount();
 
     if ((data == NULL) || (length == 0U) ||
-        (osMutexAcquire(usbTxMutexHandle, USB_TX_READY_TIMEOUT_MS) != osOK))
+        (osMutexAcquire(usbTxMutexHandle, USB_TX_MUTEX_TIMEOUT_MS) != osOK))
     {
         return false;
     }
 
-    if (wait_for_tx_idle(USB_TX_READY_TIMEOUT_MS) &&
-        (CDC_Transmit_FS(data, length) == USBD_OK))
+    /* TxState can change between the idle check and CDC_Transmit_FS().
+       Treat USBD_BUSY as transient and keep trying until the submit deadline. */
+    while ((osKernelGetTickCount() - started_at) < USB_TX_SUBMIT_TIMEOUT_MS)
     {
-        succeeded = wait_for_tx_idle(USB_TX_COMPLETE_TIMEOUT_MS);
+        const uint32_t elapsed = osKernelGetTickCount() - started_at;
+        const uint32_t remaining = USB_TX_SUBMIT_TIMEOUT_MS - elapsed;
+
+        if (wait_for_tx_idle(remaining) &&
+            (CDC_Transmit_FS(data, length) == USBD_OK))
+        {
+            succeeded = wait_for_tx_idle(USB_TX_COMPLETE_TIMEOUT_MS);
+            break;
+        }
+        (void)osDelay(1U);
     }
 
     (void)osMutexRelease(usbTxMutexHandle);
