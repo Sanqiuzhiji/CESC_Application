@@ -57,10 +57,22 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define CURRENT_1_Pin GPIO_PIN_0
+#define CURRENT_1_GPIO_Port GPIOC
+#define CURRENT_2_Pin GPIO_PIN_1
+#define CURRENT_2_GPIO_Port GPIOC
+#define CURRENT_3_Pin GPIO_PIN_2
+#define CURRENT_3_GPIO_Port GPIOC
 #define GREEN_LED_Pin GPIO_PIN_0
 #define GREEN_LED_GPIO_Port GPIOB
 #define RED_LED_Pin GPIO_PIN_1
 #define RED_LED_GPIO_Port GPIOB
+#define SPI3_CS_Pin GPIO_PIN_9
+#define SPI3_CS_GPIO_Port GPIOC
+#define DRV_EN_GATE_Pin GPIO_PIN_5
+#define DRV_EN_GATE_GPIO_Port GPIOB
+#define DRV_FAULT_N_Pin GPIO_PIN_7
+#define DRV_FAULT_N_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
