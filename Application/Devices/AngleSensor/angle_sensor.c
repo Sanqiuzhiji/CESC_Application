@@ -20,6 +20,11 @@ static uint32_t last_poll_ms;
 static uint32_t last_diagnostic_ms;
 static volatile bool sample_valid;
 static volatile uint32_t sample_sequence;
+static uint16_t previous_raw;
+static int32_t position_counts;
+static volatile uint16_t electrical_zero_raw;
+static volatile bool electrical_zero_calibrated;
+static volatile uint16_t electrical_raw_fast;
 
 static void delay_ms(uint32_t milliseconds)
 {
@@ -122,6 +127,11 @@ bool angle_sensor_init(void)
     latest_sample.status = ANGLE_SENSOR_STATUS_UNINITIALIZED;
     sample_valid = false;
     sample_sequence = 0U;
+    previous_raw = 0U;
+    position_counts = 0;
+    electrical_zero_raw = 0U;
+    electrical_zero_calibrated = false;
+    electrical_raw_fast = 0U;
     last_poll_ms = now;
     last_diagnostic_ms = now;
 
@@ -139,6 +149,7 @@ void angle_sensor_process(void)
 {
     const uint32_t now = HAL_GetTick();
     uint16_t raw;
+    int32_t delta = 0;
 
     if ((uint32_t)(now - last_poll_ms) < ANGLE_SENSOR_POLL_PERIOD_MS)
     {
@@ -156,10 +167,43 @@ void angle_sensor_process(void)
         return;
     }
 
+    if (sample_valid)
+    {
+        delta = (int32_t)raw - (int32_t)previous_raw;
+        if (delta > 2048)
+        {
+            delta -= 4096;
+        }
+        else if (delta < -2048)
+        {
+            delta += 4096;
+        }
+        position_counts += delta;
+    }
+    else
+    {
+        position_counts = (int32_t)raw;
+    }
+    previous_raw = raw;
+
     ++sample_sequence;
     __DMB();
     latest_sample.raw = raw;
     latest_sample.degrees = (float)raw * (360.0F / 4096.0F);
+    latest_sample.position_counts = position_counts;
+    latest_sample.position_degrees =
+        (float)position_counts * (360.0F / 4096.0F);
+    latest_sample.electrical_raw_unaligned = (uint16_t)(
+        ((uint32_t)raw * ANGLE_SENSOR_MOTOR_POLE_PAIRS) & 0x0FFFU);
+    latest_sample.electrical_degrees_unaligned =
+        (float)latest_sample.electrical_raw_unaligned * (360.0F / 4096.0F);
+    latest_sample.electrical_zero_raw = electrical_zero_raw;
+    latest_sample.electrical_raw = (uint16_t)(
+        (latest_sample.electrical_raw_unaligned - electrical_zero_raw) & 0x0FFFU);
+    latest_sample.electrical_degrees =
+        (float)latest_sample.electrical_raw * (360.0F / 4096.0F);
+    latest_sample.electrical_zero_calibrated = electrical_zero_calibrated;
+    electrical_raw_fast = latest_sample.electrical_raw;
     latest_sample.timestamp_ms = now;
     sample_valid = true;
 
@@ -225,6 +269,35 @@ bool angle_sensor_read_raw(uint16_t* raw)
         return false;
     }
     *raw = sample.raw;
+    return true;
+}
+
+bool angle_sensor_calibrate_electrical_zero(uint16_t target_electrical_raw)
+{
+    angle_sensor_sample_t sample;
+
+    if (!angle_sensor_get_sample(&sample) ||
+        ((sample.status != ANGLE_SENSOR_STATUS_OK) &&
+         (sample.status != ANGLE_SENSOR_STATUS_MAGNET_WEAK) &&
+         (sample.status != ANGLE_SENSOR_STATUS_MAGNET_STRONG)) ||
+        ((uint32_t)(HAL_GetTick() - sample.timestamp_ms) > 20U))
+    {
+        return false;
+    }
+    electrical_zero_raw = (uint16_t)(
+        (sample.electrical_raw_unaligned - target_electrical_raw) & 0x0FFFU);
+    __DMB();
+    electrical_zero_calibrated = true;
+    return true;
+}
+
+bool angle_sensor_get_electrical_raw_fast(uint16_t *electrical_raw)
+{
+    if ((electrical_raw == NULL) || !electrical_zero_calibrated)
+    {
+        return false;
+    }
+    *electrical_raw = electrical_raw_fast;
     return true;
 }
 

@@ -1,0 +1,105 @@
+#ifndef POWER_STAGE_H
+#define POWER_STAGE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef enum {
+  POWER_STAGE_UNINITIALIZED = 0,
+  POWER_STAGE_CALIBRATING,
+  POWER_STAGE_READY,
+  POWER_STAGE_RUNNING,
+  POWER_STAGE_FAULT
+} power_stage_state_t;
+
+typedef struct {
+  uint16_t raw[3];
+  int32_t centered[3];
+  uint16_t offset[3];
+  uint32_t sequence;
+} power_stage_current_sample_t;
+
+typedef struct {
+  power_stage_state_t state;
+  power_stage_current_sample_t current;
+  uint16_t drv_faults;
+  uint16_t bus_voltage_raw;
+  uint32_t bus_voltage_mv;
+  bool gate_enabled;
+  bool pwm_outputs_enabled;
+  bool fault_pin_active;
+  bool bus_voltage_valid;
+  uint32_t test_current_samples;
+  int64_t test_current_sum[3];
+  int16_t test_current_min[3];
+  int16_t test_current_max[3];
+  uint64_t test_current_balance_abs_sum;
+  uint16_t test_current_balance_abs_max;
+  uint32_t test_v0_samples;
+  uint32_t test_v7_samples;
+  uint32_t test_reconstructed_samples[3];
+  uint32_t test_transform_samples;
+  int64_t test_id_sum_ma;
+  int64_t test_iq_sum_ma;
+  int32_t test_id_min_ma;
+  int32_t test_id_max_ma;
+  int32_t test_iq_min_ma;
+  int32_t test_iq_max_ma;
+  int64_t test_iq_target_sum_ma;
+  int32_t test_iq_target_min_ma;
+  int32_t test_iq_target_max_ma;
+  uint32_t test_voltage_saturated_samples;
+  uint32_t test_integral_d_saturated_samples;
+  uint32_t test_integral_q_saturated_samples;
+  uint64_t test_voltage_request_sum_counts;
+  uint16_t test_voltage_request_max_counts;
+  uint32_t resistance_measurement_samples;
+  int64_t resistance_iq_sum_ma;
+  int64_t resistance_vq_sum_mv;
+} power_stage_diagnostics_t;
+
+typedef enum {
+  POWER_STAGE_TEST_IDLE = 0,
+  POWER_STAGE_TEST_RUNNING,
+  POWER_STAGE_TEST_COMPLETED,
+  POWER_STAGE_TEST_ABORTED
+} power_stage_test_state_t;
+
+/**
+ * Start synchronized current sampling with all gate outputs disabled.
+ * This function never enables the MOSFET bridge.
+ */
+bool power_stage_init(void);
+
+/** Perform deferred diagnostics such as reading DRV8301 fault registers. */
+void power_stage_process(void);
+
+/** Disable PWM outputs and EN_GATE immediately. Safe from interrupt context. */
+void power_stage_disable(void);
+
+/**
+ * Enable the bridge at the supplied raw timer duties. During commissioning,
+ * compares are clamped to +/-10% around the 50% neutral point.
+ * Not used automatically; callers must first verify READY state and hardware.
+ */
+bool power_stage_enable(uint16_t duty_a, uint16_t duty_b, uint16_t duty_c);
+
+/** Atomically update three PWM compare values while the bridge is running. */
+bool power_stage_set_duty(uint16_t duty_a, uint16_t duty_b, uint16_t duty_c);
+
+/** Start the fixed, low-energy commissioning rotation. */
+bool power_stage_start_commissioning_test(int8_t direction);
+bool power_stage_start_encoder_alignment(void);
+bool power_stage_start_encoder_voltage_test(int8_t direction);
+bool power_stage_start_current_foc_test(int8_t direction);
+bool power_stage_start_resistance_measurement(void);
+void power_stage_stop_commissioning_test(void);
+power_stage_test_state_t power_stage_get_test_state(void);
+uint8_t power_stage_get_test_steps_completed(void);
+
+power_stage_state_t power_stage_get_state(void);
+bool power_stage_get_current_sample(power_stage_current_sample_t *sample);
+uint16_t power_stage_get_latched_faults(void);
+bool power_stage_get_diagnostics(power_stage_diagnostics_t *diagnostics);
+
+#endif /* POWER_STAGE_H */

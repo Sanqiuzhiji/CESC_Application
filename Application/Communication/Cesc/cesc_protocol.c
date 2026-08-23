@@ -7,6 +7,7 @@
 #include "cmsis_os2.h"
 #include "firmware_update.h"
 #include "main.h"
+#include "power_stage.h"
 #include "usb_cdc_transport.h"
 #include "cesc_crc.h"
 
@@ -44,6 +45,13 @@ enum {
     SENSOR_ENUMERATE = 0x00,
     SENSOR_GET_SAMPLE = 0x01,
     SENSOR_GET_STATUS = 0x02,
+    MOTOR_GET_POWER_STAGE_STATUS = 0x00,
+    MOTOR_START_COMMISSIONING_TEST = 0x01,
+    MOTOR_STOP = 0x02,
+    MOTOR_CALIBRATE_ENCODER_ZERO = 0x03,
+    MOTOR_START_ENCODER_VOLTAGE_TEST = 0x04,
+    MOTOR_START_CURRENT_FOC_TEST = 0x05,
+    MOTOR_MEASURE_RESISTANCE = 0x06,
     TELEMETRY_ENUM_CHANNELS = 0x00,
     TELEMETRY_SUBSCRIBE = 0x01,
     TELEMETRY_UNSUBSCRIBE = 0x02,
@@ -64,6 +72,7 @@ enum {
     CAP_FIRMWARE = 1U << 0,
     CAP_SENSOR = 1U << 1,
     CAP_TELEMETRY = 1U << 2,
+    CAP_MOTOR = 1U << 4,
     DATA_UINT8 = 0,
     DATA_UINT16 = 2,
     DATA_FLOAT32 = 8,
@@ -246,7 +255,8 @@ static void system_service(uint8_t command, uint16_t sequence,
                            const uint8_t *payload, uint16_t length)
 {
     uint16_t index = 2U;
-    const uint64_t capabilities = CAP_FIRMWARE | CAP_SENSOR | CAP_TELEMETRY;
+    const uint64_t capabilities =
+        CAP_FIRMWARE | CAP_SENSOR | CAP_TELEMETRY | CAP_MOTOR;
 
     switch (command)
     {
@@ -502,6 +512,15 @@ static void sensor_service(uint8_t command, uint16_t sequence,
         write_u16(&response_buffer[index], sample.raw); index += 2U;
         write_float(&response_buffer[index], sample.degrees); index += 4U;
         write_u64(&response_buffer[index], (uint64_t)sample.timestamp_ms * 1000U); index += 8U;
+        write_u32(&response_buffer[index], (uint32_t)sample.position_counts); index += 4U;
+        write_float(&response_buffer[index], sample.position_degrees); index += 4U;
+        write_u16(&response_buffer[index], sample.electrical_raw_unaligned); index += 2U;
+        write_float(&response_buffer[index], sample.electrical_degrees_unaligned); index += 4U;
+        response_buffer[index++] = ANGLE_SENSOR_MOTOR_POLE_PAIRS;
+        response_buffer[index++] = sample.electrical_zero_calibrated ? 1U : 0U;
+        write_u16(&response_buffer[index], sample.electrical_zero_raw); index += 2U;
+        write_u16(&response_buffer[index], sample.electrical_raw); index += 2U;
+        write_float(&response_buffer[index], sample.electrical_degrees); index += 4U;
         break;
     case SENSOR_GET_STATUS:
         if (length != 1U) { send_response(SERVICE_SENSOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
@@ -618,6 +637,125 @@ static void telemetry_service(uint8_t command, uint16_t sequence,
                   status == STATUS_OK ? (uint16_t)(index - 2U) : 0U);
 }
 
+static void motor_service(uint8_t command, uint16_t sequence,
+                          const uint8_t *payload, uint16_t length)
+{
+    uint16_t index = 2U;
+    power_stage_diagnostics_t diagnostics;
+
+    (void)payload;
+    switch (command)
+    {
+    case MOTOR_GET_POWER_STAGE_STATUS:
+        if (length != 0U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_get_diagnostics(&diagnostics)) { send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U); return; }
+        response_buffer[index++] = (uint8_t)diagnostics.state;
+        response_buffer[index++] =
+            (diagnostics.gate_enabled ? 1U : 0U) |
+            (diagnostics.pwm_outputs_enabled ? 2U : 0U) |
+            (diagnostics.fault_pin_active ? 4U : 0U) |
+            (diagnostics.bus_voltage_valid ? 8U : 0U);
+        write_u16(&response_buffer[index], diagnostics.drv_faults); index += 2U;
+        write_u16(&response_buffer[index], diagnostics.bus_voltage_raw); index += 2U;
+        write_u32(&response_buffer[index], diagnostics.bus_voltage_mv); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.current.sequence); index += 4U;
+        for (uint32_t phase = 0U; phase < 3U; ++phase)
+        {
+            write_u16(&response_buffer[index], diagnostics.current.raw[phase]); index += 2U;
+            write_u16(&response_buffer[index], diagnostics.current.offset[phase]); index += 2U;
+            write_u32(&response_buffer[index], (uint32_t)diagnostics.current.centered[phase]); index += 4U;
+        }
+        response_buffer[index++] = (uint8_t)power_stage_get_test_state();
+        response_buffer[index++] = power_stage_get_test_steps_completed();
+        write_u32(&response_buffer[index], diagnostics.test_current_samples); index += 4U;
+        for (uint32_t phase = 0U; phase < 3U; ++phase)
+        {
+            write_u64(&response_buffer[index], (uint64_t)diagnostics.test_current_sum[phase]); index += 8U;
+            write_u16(&response_buffer[index], (uint16_t)diagnostics.test_current_min[phase]); index += 2U;
+            write_u16(&response_buffer[index], (uint16_t)diagnostics.test_current_max[phase]); index += 2U;
+        }
+        write_u64(&response_buffer[index], diagnostics.test_current_balance_abs_sum); index += 8U;
+        write_u16(&response_buffer[index], diagnostics.test_current_balance_abs_max); index += 2U;
+        write_u32(&response_buffer[index], diagnostics.test_v0_samples); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.test_v7_samples); index += 4U;
+        for (uint32_t phase = 0U; phase < 3U; ++phase)
+        {
+            write_u32(&response_buffer[index], diagnostics.test_reconstructed_samples[phase]); index += 4U;
+        }
+        write_u32(&response_buffer[index], diagnostics.test_transform_samples); index += 4U;
+        write_u64(&response_buffer[index], (uint64_t)diagnostics.test_id_sum_ma); index += 8U;
+        write_u64(&response_buffer[index], (uint64_t)diagnostics.test_iq_sum_ma); index += 8U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.test_id_min_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.test_id_max_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.test_iq_min_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.test_iq_max_ma); index += 4U;
+        write_u64(&response_buffer[index], (uint64_t)diagnostics.test_iq_target_sum_ma); index += 8U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.test_iq_target_min_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.test_iq_target_max_ma); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.test_voltage_saturated_samples); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.test_integral_d_saturated_samples); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.test_integral_q_saturated_samples); index += 4U;
+        write_u64(&response_buffer[index], diagnostics.test_voltage_request_sum_counts); index += 8U;
+        write_u16(&response_buffer[index], diagnostics.test_voltage_request_max_counts); index += 2U;
+        write_u32(&response_buffer[index], diagnostics.resistance_measurement_samples); index += 4U;
+        write_u64(&response_buffer[index], (uint64_t)diagnostics.resistance_iq_sum_ma); index += 8U;
+        write_u64(&response_buffer[index], (uint64_t)diagnostics.resistance_vq_sum_mv); index += 8U;
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK,
+                      (uint16_t)(index - 2U));
+        return;
+    case MOTOR_START_COMMISSIONING_TEST:
+        if (length != 1U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_start_commissioning_test((int8_t)payload[0])) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_STOP:
+        if (length != 0U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        power_stage_stop_commissioning_test();
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_CALIBRATE_ENCODER_ZERO:
+        if (length != 0U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_start_encoder_alignment()) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_START_ENCODER_VOLTAGE_TEST:
+        if (length != 1U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_start_encoder_voltage_test((int8_t)payload[0])) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_START_CURRENT_FOC_TEST:
+        if (length != 1U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_start_current_foc_test((int8_t)payload[0])) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_MEASURE_RESISTANCE:
+        if (length != 0U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_start_resistance_measurement()) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    default:
+        ++stats.unsupported_requests;
+        send_response(SERVICE_MOTOR, command, sequence,
+                      STATUS_INVALID_COMMAND, 0U);
+        return;
+    }
+}
+
 static void dispatch_request(uint8_t service, uint8_t command,
                              uint16_t sequence, const uint8_t *payload,
                              uint16_t length)
@@ -633,8 +771,8 @@ static void dispatch_request(uint8_t service, uint8_t command,
     case SERVICE_FIRMWARE: firmware_service(command, sequence, payload, length); break;
     case SERVICE_SENSOR: sensor_service(command, sequence, payload, length); break;
     case SERVICE_TELEMETRY: telemetry_service(command, sequence, payload, length); break;
+    case SERVICE_MOTOR: motor_service(command, sequence, payload, length); break;
     case SERVICE_CONFIGURATION:
-    case SERVICE_MOTOR:
     case SERVICE_DIAGNOSTIC:
         send_response(service, command, sequence, STATUS_NOT_SUPPORTED, 0U);
         break;

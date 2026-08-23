@@ -51,7 +51,17 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Application/Communication/Cesc/cesc_protocol.c
     Application/Devices/AngleSensor/angle_sensor.c
     Application/Devices/AngleSensor/as5600.c
+    Application/Devices/GateDriver/drv8301.c
+    Application/MotorControl/PowerStage/power_stage.c
     Application/Services/FirmwareUpdate/firmware_update.c
+)
+
+# Motor-control interrupt code must meet its real-time deadline even when the
+# rest of the firmware is built with Debug symbols and -O0 for source-level
+# debugging. Keep -g globally, but compile this translation unit optimized.
+set_source_files_properties(
+    Application/MotorControl/PowerStage/power_stage.c
+    PROPERTIES COMPILE_OPTIONS "-O2"
 )
 
 # Add include paths
@@ -60,6 +70,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Application/Communication/Cesc
     Application/Communication/Usb
     Application/Devices/AngleSensor
+    Application/Devices/GateDriver
+    Application/MotorControl/PowerStage
     Application/Services/FirmwareUpdate
 )
 

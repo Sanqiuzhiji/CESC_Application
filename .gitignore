@@ -1,6 +1,7 @@
 # IDE and local tooling
 /.idea/
 /.codex/
+/.codex_tmp/
 /.vscode/
 *.user
 

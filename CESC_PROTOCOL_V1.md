@@ -566,13 +566,44 @@ firstTimestampUs + i * samplePeriodUs
 
 流传输为尽力而为。带宽耗尽时，固件 SHOULD 丢弃遥测数据，而不得阻塞控制、请求响应或安全任务。
 
-## 11. 诊断服务（`0x06`）
+## 11. 电机服务（`0x05`）
 
-### 11.1 `SET_LOG_LEVEL`（`0x00`）
+### 11.1 `GET_POWER_STAGE_STATUS`（`0x00`）
+
+请求 Payload：空。该命令只读，不会使能功率桥。成功响应数据为：
+
+```text
+uint8  state              // 0=未初始化, 1=校准中, 2=就绪, 3=运行, 4=故障
+uint8  flags              // bit0 EN_GATE, bit1 六路PWM, bit2 nFAULT有效, bit3母线电压有效
+uint16 drvFaults
+uint16 busVoltageRaw
+uint32 busVoltageMv
+uint32 currentSequence
+重复三相 A、B、C：
+    uint16 currentRaw
+    uint16 currentOffset
+    int32  currentCentered
+uint8  testState          // 0=空闲, 1=运行, 2=完成, 3=中止
+uint8  testStepsCompleted // 本次标定测试已完成的换相步数
+```
+
+`currentCentered = currentRaw - currentOffset`，单位为 ADC count。电流放大器增益确认前不得将其解释为安培。
+
+### 11.2 `START_COMMISSIONING_TEST`（`0x01`）
+
+请求 Payload：`int8 direction`，只接受 `+1` 或 `-1`。这是受限调试命令：仅允许母线 6–10 V、功率级 READY、无锁存故障时启动；当前实现固定约 ±8.3% 调制度、500 ms 对齐、精确 30 个换相步和 200 ms 末端稳定保持，并设有 3 s 独立总超时。占空比另受 ±10% 绝对上限约束，并独立执行 ADC 过流与 nFAULT 关断。
+
+### 11.3 `STOP`（`0x02`）
+
+请求 Payload：空。立即关闭六路 PWM 和 EN_GATE。主机应在异常、超时或关闭连接时尽力发送此命令；固件自身的 3 s 超时不依赖该请求。
+
+## 12. 诊断服务（`0x06`）
+
+### 12.1 `SET_LOG_LEVEL`（`0x00`）
 
 请求 Payload：`uint8 minimumLevel`。级别：Debug=0、Info=1、Warning=2、Error=3、Off=255。
 
-### 11.2 日志事件（`CommandId 0x80`）
+### 12.2 日志事件（`CommandId 0x80`）
 
 设备以 `MessageType = EVENT` 发送：
 
@@ -585,7 +616,7 @@ string message
 
 MUST NOT 将未封帧 ASCII 日志插入 CESC 协议流。
 
-## 12. 流量控制与优先级
+## 13. 流量控制与优先级
 
 设备发送优先级（由高到低）：
 
@@ -600,7 +631,7 @@ MUST NOT 将未封帧 ASCII 日志插入 CESC 协议流。
 
 主机 SHOULD 基于未完成事务限制命令速率。固件升级期间，它 MUST 在 BEGIN 前停止遥测，且 MUST NOT 发送无关的状态变更命令。
 
-## 13. 安全与功能安全
+## 14. 安全与功能安全
 
 版本 1 提供完整性检测，不提供认证或加密。CRC 无法抵御恶意篡改。
 
@@ -616,7 +647,7 @@ MUST NOT 将未封帧 ASCII 日志插入 CESC 协议流。
 
 在可信网络以外使用的网络传输需要未来的认证协议层；本规范不提供安全保护。
 
-## 14. 兼容性规则
+## 15. 兼容性规则
 
 - Version 字段决定帧及公共语义兼容性。
 - MAY 在已有服务中增加新命令。
@@ -625,7 +656,7 @@ MUST NOT 将未封帧 ASCII 日志插入 CESC 协议流。
 - 未知 ServiceId 返回 `INVALID_SERVICE`；已知服务中的未知 CommandId 返回 `INVALID_COMMAND`。
 - 帧验证后，未知事件和流 MUST 忽略；保留值 MUST NOT 以不兼容方式重新利用。
 
-## 15. 必需测试向量
+## 16. 必需测试向量
 
 ### 15.1 空 PING 请求
 
@@ -662,7 +693,7 @@ CRC bytes:     60 0D
 
 两个实现 MUST 都能复现这些精确字节。
 
-## 16. 版本 1 最小实现里程碑
+## 17. 版本 1 最小实现里程碑
 
 在开始电机控制开发前，固件和 CESC Tool SHOULD 共同达到以下里程碑：
 
@@ -702,6 +733,9 @@ CRC bytes:     60 0D
 | Telemetry | STOP_ALL | `0x03` | Request/Response |
 | Telemetry | GET_STREAM_STATUS | `0x04` | Request/Response |
 | Telemetry | STREAM_DATA | `0x80` | Stream |
+| Motor | GET_POWER_STAGE_STATUS | `0x00` | Request/Response |
+| Motor | START_COMMISSIONING_TEST | `0x01` | Request/Response |
+| Motor | STOP | `0x02` | Request/Response |
 | Diagnostic | SET_LOG_LEVEL | `0x00` | Request/Response |
 | Diagnostic | LOG | `0x80` | Event |
 
