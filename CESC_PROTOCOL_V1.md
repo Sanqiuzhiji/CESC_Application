@@ -589,6 +589,64 @@ uint8  testStepsCompleted // 本次标定测试已完成的换相步数
 
 `currentCentered = currentRaw - currentOffset`，单位为 ADC count。电流放大器增益确认前不得将其解释为安培。
 
+功率级基础诊断字段之后保留现有 commissioning 统计字段。响应偏移 204 起追加相电阻辨识数据（所有多字节字段均为小端）：
+
+```text
+uint8  resistancePhase       // 0空闲, 1校零, 2待使能, 3..10测量阶段, 11完成
+uint8  resistanceValid       // 1表示正反向结果均通过有效性检查
+uint32 forwardSamples
+uint32 reverseSamples
+int32  idMa                  // 实时FOC内部Id，mA
+int32  iqMa                  // 实时FOC内部Iq，mA
+int32  vdMv                  // 实时FOC内部Vd，mV
+int32  vqMv                  // 实时FOC内部Vq，mV
+int32  liveResistanceMilliOhms
+int32  forwardResistanceMilliOhms
+int32  reverseResistanceMilliOhms
+int32  averageResistanceMilliOhms
+```
+
+### 11.4 `MEASURE_RESISTANCE`（`0x06`）
+
+请求 Payload：空。命令仅在功率级 READY、无锁存故障且母线电压为 6–10 V 时启动。辨识流程保持功率输出关闭并重新平均 1024 次 ADC offset，随后固定电角度，令 `Iq_target=0`，依次注入 `+0.5 A Id` 和 `-0.5 A Id`。每个方向包含 500 ms 斜坡、800 ms 稳定等待和 1000 ms 多点采样；方向切换前回零 300 ms，结束时斜坡降流 500 ms。
+
+固件直接累计FOC电流环内部的 `Id` 和限幅后的 `Vd`，不从PWM duty反算电压：
+
+```text
+Rs_forward = average(Vd_forward) / average(Id_forward)
+Rs_reverse = average(Vd_reverse) / average(Id_reverse)
+Rs          = (Rs_forward + Rs_reverse) / 2
+```
+
+相电阻辨识单独允许最大50%电压矢量，以在6 V母线下为5.4 Ω相电阻和0.5 A测试电流提供调节余量；该限制不改变其他commissioning与FOC控制路径的调制度上限。ADC软件过流、DRV8301 nFAULT和母线电压限制始终有效。
+
+### Phase Inductance 与 Flux Linkage 辨识扩展
+
+`MOTOR_MEASURE_INDUCTANCE (0x07)` 无请求载荷，要求当前会话已经完成且保留有效的相电阻结果。辨识在固定 d 轴施加正负双极性方波，等待周期稳态后分别累计 250 个端点平均值，再用精确 RL 方波响应计算相电感。正负方向结果用于诊断，最终值由差分电压和差分电流计算，以抵消 ADC 偏置与逆变器方向压降。
+
+`MOTOR_MEASURE_FLUX (0x08)` 请求载荷为一个 `int8` 方向（`+1` 或 `-1`），同样要求有效 Rs。模块使用 AS5600 实际机械位置产生受限的 60 rpm 旋转电压矢量，仅接收 300–420 degree/s、方向一致且传感器新鲜的稳态样本。三路 AD8418 使用 inline full-Clarke 电流变换。稳态 PMSM 关系为：
+
+`lambda = (Vq - Rs * Iq) / omega_e`
+
+`Ke_mechanical = pole_pairs * lambda`
+
+`KV = 60 / (2*pi*pole_pairs*lambda)`
+
+建议依次执行 Rs、L，再对 `0x08` 执行正转和反转，将两次 `lambda` 平均后重新计算 Ke/KV。台架实测（8.05 V、11 极对）正转 `0.015510 Wb`、反转 `0.017272 Wb`，平均 `0.016391 Wb`，对应 `Ke=0.1803 V/(rad/s)`、`KV=52.96 rpm/V`；铭牌 KV 为 54 rpm/V。
+
+功率级状态响应在相电感字段（偏移 246–275）之后追加：
+
+| 偏移 | 类型 | 字段 |
+|---:|---|---|
+| 276 | uint8 | flux_valid |
+| 277 | uint32 | flux_samples |
+| 281 | int32 | mechanical_speed_millidegrees_per_second |
+| 285 | int32 | Iq_mA |
+| 289 | int32 | Vq_mV |
+| 293 | uint32 | flux_linkage_uWb |
+| 297 | uint32 | mechanical_Ke_uV_per_rad_s |
+| 301 | uint32 | KV_milliRPM_per_V |
+
 ### 11.2 `START_COMMISSIONING_TEST`（`0x01`）
 
 请求 Payload：`int8 direction`，只接受 `+1` 或 `-1`。这是受限调试命令：仅允许母线 6–10 V、功率级 READY、无锁存故障时启动；当前实现固定约 ±8.3% 调制度、500 ms 对齐、精确 30 个换相步和 200 ms 末端稳定保持，并设有 3 s 独立总超时。占空比另受 ±10% 绝对上限约束，并独立执行 ADC 过流与 nFAULT 关断。
@@ -736,6 +794,13 @@ CRC bytes:     60 0D
 | Motor | GET_POWER_STAGE_STATUS | `0x00` | Request/Response |
 | Motor | START_COMMISSIONING_TEST | `0x01` | Request/Response |
 | Motor | STOP | `0x02` | Request/Response |
+| Motor | CALIBRATE_ENCODER_ZERO | `0x03` | Request/Response |
+| Motor | START_ENCODER_VOLTAGE_TEST | `0x04` | Request/Response |
+| Motor | START_CURRENT_FOC_TEST | `0x05` | Request/Response |
+| Motor | MEASURE_PHASE_RESISTANCE | `0x06` | Request/Response |
+| Motor | MEASURE_PHASE_INDUCTANCE | `0x07` | Request/Response |
+| Motor | MEASURE_FLUX_LINKAGE | `0x08` | Request/Response |
+| Motor | MEASURE_RESISTANCE | `0x06` | Request/Response |
 | Diagnostic | SET_LOG_LEVEL | `0x00` | Request/Response |
 | Diagnostic | LOG | `0x80` | Event |
 

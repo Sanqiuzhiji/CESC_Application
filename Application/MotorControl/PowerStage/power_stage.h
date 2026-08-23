@@ -56,6 +56,35 @@ typedef struct {
   uint32_t resistance_measurement_samples;
   int64_t resistance_iq_sum_ma;
   int64_t resistance_vq_sum_mv;
+  uint8_t resistance_phase;
+  uint8_t resistance_valid;
+  uint32_t resistance_forward_samples;
+  uint32_t resistance_reverse_samples;
+  int32_t resistance_id_ma;
+  int32_t resistance_iq_ma;
+  int32_t resistance_vd_mv;
+  int32_t resistance_vq_mv;
+  int32_t resistance_live_milliohms;
+  int32_t resistance_forward_milliohms;
+  int32_t resistance_reverse_milliohms;
+  int32_t resistance_average_milliohms;
+  uint8_t inductance_phase;
+  uint8_t inductance_valid;
+  uint32_t inductance_forward_samples;
+  uint32_t inductance_reverse_samples;
+  int32_t inductance_delta_current_ma;
+  int32_t inductance_voltage_mv;
+  uint32_t inductance_forward_uh;
+  uint32_t inductance_reverse_uh;
+  uint32_t inductance_average_uh;
+  uint8_t flux_valid;
+  uint32_t flux_samples;
+  int32_t flux_speed_millidegrees_per_second;
+  int32_t flux_iq_ma;
+  int32_t flux_vq_mv;
+  uint32_t flux_linkage_uwb;
+  uint32_t back_emf_constant_uv_per_rad_s;
+  uint32_t kv_millirpm_per_volt;
 } power_stage_diagnostics_t;
 
 typedef enum {
@@ -79,7 +108,8 @@ void power_stage_disable(void);
 
 /**
  * Enable the bridge at the supplied raw timer duties. During commissioning,
- * compares are clamped to +/-10% around the 50% neutral point.
+ * compares are normally clamped to +/-10% around the 50% neutral point.
+ * Resistance identification applies its own bounded voltage-vector limit.
  * Not used automatically; callers must first verify READY state and hardware.
  */
 bool power_stage_enable(uint16_t duty_a, uint16_t duty_b, uint16_t duty_c);
@@ -93,6 +123,8 @@ bool power_stage_start_encoder_alignment(void);
 bool power_stage_start_encoder_voltage_test(int8_t direction);
 bool power_stage_start_current_foc_test(int8_t direction);
 bool power_stage_start_resistance_measurement(void);
+bool power_stage_start_inductance_measurement(void);
+bool power_stage_start_flux_measurement(int8_t direction);
 void power_stage_stop_commissioning_test(void);
 power_stage_test_state_t power_stage_get_test_state(void);
 uint8_t power_stage_get_test_steps_completed(void);

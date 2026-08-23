@@ -1,6 +1,7 @@
 #include "power_stage.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stddef.h>
 
 #include "adc.h"
@@ -11,8 +12,10 @@
 
 enum {
   CURRENT_CALIBRATION_SAMPLES = 1024U,
-  /* Absolute commissioning ceiling: +/-10% around center-aligned neutral. */
+  /* Default commissioning ceiling: +/-10% around center-aligned neutral. */
   COMMISSIONING_MODULATION_DIVISOR = 10U,
+  /* Rs identification needs 2.7 V for 0.5 A into the specified 5.4 ohm phase. */
+  RESISTANCE_MODULATION_DIVISOR = 2U,
   BUS_VOLTAGE_SAMPLE_PERIOD_MS = 100U,
   ADC_FULL_SCALE = 4095U,
   ADC_REFERENCE_MV = 3300U,
@@ -41,10 +44,19 @@ enum {
   CURRENT_FOC_TARGET_DEGREES_PER_SECOND = 10U,
   CURRENT_FOC_OUTER_LOOP_PERIOD_MS = 10U,
   CURRENT_FOC_RAMP_DOWN_MS = 500U,
-  RESISTANCE_RAMP_UP_MS = 500U,
-  RESISTANCE_SETTLE_END_MS = 1000U,
-  RESISTANCE_SAMPLE_END_MS = 2000U,
-  RESISTANCE_TEST_END_MS = 2500U,
+  RESISTANCE_RAMP_MS = 500U,
+  RESISTANCE_SETTLE_MS = 800U,
+  RESISTANCE_SAMPLE_MS = 1000U,
+  RESISTANCE_ZERO_MS = 300U,
+  RESISTANCE_RAMP_DOWN_MS = 500U,
+  RESISTANCE_TIMEOUT_MS = 6000U,
+  INDUCTANCE_TIMEOUT_MS = 3000U,
+  INDUCTANCE_HALF_PERIOD_TICKS = 20U,
+  INDUCTANCE_ENDPOINT_AVERAGE_TICKS = 8U,
+  INDUCTANCE_SETTLE_HALF_PERIODS = 40U,
+  INDUCTANCE_TARGET_SAMPLES_PER_DIRECTION = 250U,
+  FLUX_SAMPLE_START_MS = 4000U,
+  FLUX_SAMPLE_END_MS = 9000U,
   ENCODER_CONTROL_MAX_SAMPLE_AGE_MS = 50U,
   ENCODER_CONTROL_INVALID_LIMIT = 5U,
   CURRENT_TRANSFORM_DIAGNOSTIC_DIVIDER = 20U,
@@ -92,7 +104,9 @@ typedef enum {
   TEST_KIND_ENCODER_ALIGNMENT,
   TEST_KIND_ENCODER_VOLTAGE,
   TEST_KIND_CURRENT_FOC,
-  TEST_KIND_RESISTANCE
+  TEST_KIND_RESISTANCE,
+  TEST_KIND_INDUCTANCE,
+  TEST_KIND_FLUX
 } test_kind_t;
 static test_kind_t test_kind;
 static bool test_alignment_calibrated;
@@ -128,10 +142,78 @@ static volatile uint16_t test_voltage_request_max_counts;
 static volatile uint32_t resistance_measurement_samples;
 static volatile int64_t resistance_iq_sum_ma;
 static volatile int64_t resistance_vq_sum_mv;
+typedef enum {
+  RESISTANCE_PHASE_IDLE = 0,
+  RESISTANCE_PHASE_OFFSET_CALIBRATION,
+  RESISTANCE_PHASE_ENABLE_PENDING,
+  RESISTANCE_PHASE_FORWARD_RAMP,
+  RESISTANCE_PHASE_FORWARD_SETTLE,
+  RESISTANCE_PHASE_FORWARD_SAMPLE,
+  RESISTANCE_PHASE_ZERO_SETTLE,
+  RESISTANCE_PHASE_REVERSE_RAMP,
+  RESISTANCE_PHASE_REVERSE_SETTLE,
+  RESISTANCE_PHASE_REVERSE_SAMPLE,
+  RESISTANCE_PHASE_RAMP_DOWN,
+  RESISTANCE_PHASE_COMPLETE
+} resistance_phase_t;
+static volatile resistance_phase_t resistance_phase;
+static uint32_t resistance_phase_started_at;
+static volatile uint32_t resistance_forward_samples;
+static volatile uint32_t resistance_reverse_samples;
+static volatile int64_t resistance_forward_id_sum_ma;
+static volatile int64_t resistance_forward_vd_sum_mv;
+static volatile int64_t resistance_reverse_id_sum_ma;
+static volatile int64_t resistance_reverse_vd_sum_mv;
+static volatile int32_t resistance_id_ma;
+static volatile int32_t resistance_iq_ma;
+static volatile int32_t resistance_vd_mv;
+static volatile int32_t resistance_vq_mv;
+static volatile int32_t resistance_live_milliohms;
+static volatile int32_t resistance_forward_milliohms;
+static volatile int32_t resistance_reverse_milliohms;
+static volatile int32_t resistance_average_milliohms;
+static volatile bool resistance_valid;
+typedef enum {
+  INDUCTANCE_PHASE_IDLE = 0,
+  INDUCTANCE_PHASE_OFFSET_CALIBRATION,
+  INDUCTANCE_PHASE_ENABLE_PENDING,
+  INDUCTANCE_PHASE_PULSING,
+  INDUCTANCE_PHASE_COMPLETE
+} inductance_phase_t;
+static volatile inductance_phase_t inductance_phase;
+static volatile uint16_t inductance_tick;
+static volatile uint16_t inductance_half_periods;
+static volatile int8_t inductance_direction;
+static volatile int64_t inductance_baseline_sum_ma;
+static volatile uint8_t inductance_baseline_samples;
+static volatile uint32_t inductance_forward_samples;
+static volatile uint32_t inductance_reverse_samples;
+static volatile int64_t inductance_forward_delta_sum_ma;
+static volatile int64_t inductance_reverse_delta_sum_ma;
+static volatile int64_t inductance_forward_voltage_sum_mv;
+static volatile int64_t inductance_reverse_voltage_sum_mv;
+static volatile int32_t inductance_delta_current_ma;
+static volatile int32_t inductance_voltage_mv;
+static volatile uint32_t inductance_forward_uh;
+static volatile uint32_t inductance_reverse_uh;
+static volatile uint32_t inductance_average_uh;
+static volatile bool inductance_valid;
+static volatile uint32_t flux_samples;
+static volatile int64_t flux_speed_sum_mdps;
+static volatile int64_t flux_iq_sum_ma;
+static volatile int64_t flux_vq_sum_mv;
+static volatile int32_t flux_speed_mdps;
+static volatile int32_t flux_iq_ma;
+static volatile int32_t flux_vq_mv;
+static volatile uint32_t flux_linkage_uwb;
+static volatile uint32_t flux_ke_uv_per_rad_s;
+static volatile uint32_t flux_kv_millirpm_per_volt;
+static volatile bool flux_valid;
 static volatile uint8_t test_transform_divider;
 static volatile bool current_foc_active;
 static volatile float current_foc_integral_d;
 static volatile float current_foc_integral_q;
+static volatile float current_foc_id_target;
 static volatile float current_foc_iq_target;
 static uint32_t current_foc_outer_last_ms;
 static float current_foc_pll_position_counts;
@@ -141,10 +223,11 @@ static float current_foc_target_position_counts;
 static float current_foc_speed_integral_amps;
 
 static const float CURRENT_FOC_MAX_TARGET_AMPS = 0.30F;
-static const float RESISTANCE_MEASUREMENT_TARGET_AMPS = 0.25F;
+static const float RESISTANCE_MEASUREMENT_TARGET_AMPS = 0.50F;
 static const float CURRENT_FOC_TORQUE_FEEDFORWARD_AMPS = 0.12F;
 static const float CURRENT_FOC_KP_COUNTS_PER_AMP = 40.0F;
 static const float CURRENT_FOC_KI_COUNTS_PER_AMP_SECOND = 800.0F;
+static const float RESISTANCE_FOC_KI_COUNTS_PER_AMP_SECOND = 5000.0F;
 static const float CURRENT_FOC_DT_SECONDS = 0.00005F;
 static const float CURRENT_FOC_POSITION_TO_SPEED_GAIN = 1.0F;
 static const float CURRENT_FOC_MAX_SPEED_TARGET_DPS = 15.0F;
@@ -179,9 +262,27 @@ static void reset_test_current_statistics(void)
   resistance_measurement_samples = 0U;
   resistance_iq_sum_ma = 0;
   resistance_vq_sum_mv = 0;
+  resistance_phase = RESISTANCE_PHASE_IDLE;
+  resistance_phase_started_at = 0U;
+  resistance_forward_samples = 0U;
+  resistance_reverse_samples = 0U;
+  resistance_forward_id_sum_ma = 0;
+  resistance_forward_vd_sum_mv = 0;
+  resistance_reverse_id_sum_ma = 0;
+  resistance_reverse_vd_sum_mv = 0;
+  resistance_id_ma = 0;
+  resistance_iq_ma = 0;
+  resistance_vd_mv = 0;
+  resistance_vq_mv = 0;
+  resistance_live_milliohms = 0;
+  resistance_forward_milliohms = 0;
+  resistance_reverse_milliohms = 0;
+  resistance_average_milliohms = 0;
+  resistance_valid = false;
   test_transform_divider = 0U;
   current_foc_integral_d = 0.0F;
   current_foc_integral_q = 0.0F;
+  current_foc_id_target = 0.0F;
   current_foc_iq_target = 0.0F;
   current_foc_outer_last_ms = 0U;
   current_foc_pll_position_counts = 0.0F;
@@ -198,6 +299,163 @@ static void reset_test_current_statistics(void)
 }
 
 static void set_compare_values(uint16_t a, uint16_t b, uint16_t c);
+
+static int32_t resistance_from_sums_milliohms(int64_t voltage_sum_mv,
+                                              int64_t current_sum_ma)
+{
+  if ((current_sum_ma > -20) && (current_sum_ma < 20)) {
+    return 0;
+  }
+  return (int32_t)((voltage_sum_mv * 1000) / current_sum_ma);
+}
+
+static void finish_resistance_measurement(void)
+{
+  resistance_forward_milliohms = resistance_from_sums_milliohms(
+      resistance_forward_vd_sum_mv, resistance_forward_id_sum_ma);
+  resistance_reverse_milliohms = resistance_from_sums_milliohms(
+      resistance_reverse_vd_sum_mv, resistance_reverse_id_sum_ma);
+  resistance_average_milliohms =
+      (resistance_forward_milliohms + resistance_reverse_milliohms) / 2;
+  const int32_t resistance_difference =
+      resistance_forward_milliohms > resistance_reverse_milliohms ?
+          resistance_forward_milliohms - resistance_reverse_milliohms :
+          resistance_reverse_milliohms - resistance_forward_milliohms;
+  resistance_valid =
+      (resistance_forward_samples >= 1000U) &&
+      (resistance_reverse_samples >= 1000U) &&
+      (resistance_forward_id_sum_ma >
+       (int64_t)resistance_forward_samples * 350) &&
+      (resistance_reverse_id_sum_ma <
+       -(int64_t)resistance_reverse_samples * 350) &&
+      (resistance_forward_milliohms > 0) &&
+      (resistance_reverse_milliohms > 0) &&
+      ((int64_t)resistance_difference * 10 <=
+       (int64_t)resistance_forward_milliohms +
+       resistance_reverse_milliohms);
+}
+
+static void reset_inductance_statistics(void)
+{
+  inductance_phase = INDUCTANCE_PHASE_IDLE;
+  inductance_tick = 0U;
+  inductance_half_periods = 0U;
+  inductance_direction = 1;
+  inductance_baseline_sum_ma = 0;
+  inductance_baseline_samples = 0U;
+  inductance_forward_samples = 0U;
+  inductance_reverse_samples = 0U;
+  inductance_forward_delta_sum_ma = 0;
+  inductance_reverse_delta_sum_ma = 0;
+  inductance_forward_voltage_sum_mv = 0;
+  inductance_reverse_voltage_sum_mv = 0;
+  inductance_delta_current_ma = 0;
+  inductance_voltage_mv = 0;
+  inductance_forward_uh = 0U;
+  inductance_reverse_uh = 0U;
+  inductance_average_uh = 0U;
+  inductance_valid = false;
+}
+
+static void reset_flux_statistics(void)
+{
+  flux_samples = 0U;
+  flux_speed_sum_mdps = 0;
+  flux_iq_sum_ma = 0;
+  flux_vq_sum_mv = 0;
+  flux_speed_mdps = 0;
+  flux_iq_ma = 0;
+  flux_vq_mv = 0;
+  flux_linkage_uwb = 0U;
+  flux_ke_uv_per_rad_s = 0U;
+  flux_kv_millirpm_per_volt = 0U;
+  flux_valid = false;
+}
+
+static void finish_flux_measurement(void)
+{
+  if (flux_samples < 1000U || !resistance_valid) {
+    return;
+  }
+  flux_speed_mdps = (int32_t)(flux_speed_sum_mdps / flux_samples);
+  flux_iq_ma = (int32_t)(flux_iq_sum_ma / flux_samples);
+  flux_vq_mv = (int32_t)(flux_vq_sum_mv / flux_samples);
+  const float omega_e = (float)flux_speed_mdps * 0.001F *
+      (3.14159265359F / 180.0F) * 11.0F;
+  const float bemf_mv = (float)flux_vq_mv -
+      (float)resistance_average_milliohms * (float)flux_iq_ma * 0.001F;
+  if (fabsf(omega_e) < 0.5F || bemf_mv * omega_e <= 0.0F) {
+    return;
+  }
+  const float linkage_wb = (bemf_mv * 0.001F) / omega_e;
+  if (linkage_wb < 0.001F || linkage_wb > 2.0F) {
+    return;
+  }
+  flux_linkage_uwb = (uint32_t)(linkage_wb * 1000000.0F);
+  /* Datasheet Ke uses mechanical rad/s; dq flux linkage uses electrical rad/s. */
+  flux_ke_uv_per_rad_s = flux_linkage_uwb * 11U;
+  flux_kv_millirpm_per_volt = (uint32_t)(
+      60000.0F / (2.0F * 3.14159265359F * 11.0F * linkage_wb));
+  flux_valid = true;
+}
+
+static void finish_inductance_measurement(void)
+{
+  const float half_period_us =
+      (float)(INDUCTANCE_HALF_PERIOD_TICKS * 50U);
+  const float resistance_milliohms =
+      (float)resistance_average_milliohms;
+  const float forward_current_ma = (float)inductance_forward_delta_sum_ma /
+      (float)inductance_forward_samples;
+  const float reverse_current_ma = (float)inductance_reverse_delta_sum_ma /
+      (float)inductance_reverse_samples;
+  const float forward_voltage_mv = (float)inductance_forward_voltage_sum_mv /
+      (float)inductance_forward_samples;
+  const float reverse_voltage_mv = (float)inductance_reverse_voltage_sum_mv /
+      (float)inductance_reverse_samples;
+  const float forward_ratio = forward_current_ma * resistance_milliohms /
+      (forward_voltage_mv * 1000.0F);
+  const float reverse_ratio = reverse_current_ma * resistance_milliohms /
+      (reverse_voltage_mv * 1000.0F);
+  if ((forward_ratio > 0.02F) && (forward_ratio < 0.98F)) {
+    inductance_forward_uh = (uint32_t)(resistance_milliohms * half_period_us /
+        (2000.0F * atanhf(forward_ratio)));
+  }
+  if ((reverse_ratio > 0.02F) && (reverse_ratio < 0.98F)) {
+    inductance_reverse_uh = (uint32_t)(resistance_milliohms * half_period_us /
+        (2000.0F * atanhf(reverse_ratio)));
+  }
+  const float differential_current_ma =
+      (forward_current_ma + reverse_current_ma) * 0.5F;
+  const float differential_voltage_mv =
+      (forward_voltage_mv + reverse_voltage_mv) * 0.5F;
+  const float differential_ratio = differential_current_ma *
+      resistance_milliohms / (differential_voltage_mv * 1000.0F);
+  if ((differential_ratio > 0.02F) && (differential_ratio < 0.98F)) {
+    inductance_average_uh = (uint32_t)(
+        resistance_milliohms * half_period_us /
+        (2000.0F * atanhf(differential_ratio)));
+  }
+  inductance_valid =
+      (inductance_forward_samples >=
+       INDUCTANCE_TARGET_SAMPLES_PER_DIRECTION) &&
+      (inductance_reverse_samples >=
+       INDUCTANCE_TARGET_SAMPLES_PER_DIRECTION) &&
+      (forward_current_ma > 100.0F) &&
+      (reverse_current_ma > 100.0F) &&
+      (inductance_average_uh >= 100U) &&
+      (inductance_average_uh <= 100000U);
+}
+
+static void set_inductance_voltage(int8_t direction)
+{
+  const int32_t neutral = (int32_t)(TIM1->ARR / 2U);
+  const int32_t voltage_d = direction == 0 ? 0 :
+      (int32_t)(TIM1->ARR / 6U) * direction;
+  set_compare_values((uint16_t)(neutral + voltage_d),
+                     (uint16_t)(neutral - voltage_d / 2),
+                     (uint16_t)(neutral - voltage_d / 2));
+}
 
 static float fast_sine_raw(uint16_t angle_raw)
 {
@@ -251,8 +509,11 @@ static void set_commutation_step(uint8_t step)
 static uint16_t clamp_compare(uint16_t compare)
 {
   const uint16_t neutral = (uint16_t)(TIM1->ARR / 2U);
-  const uint16_t deviation =
-      (uint16_t)(TIM1->ARR / COMMISSIONING_MODULATION_DIVISOR);
+  const uint16_t divisor =
+      ((test_kind == TEST_KIND_RESISTANCE) ||
+       (test_kind == TEST_KIND_INDUCTANCE)) ?
+      RESISTANCE_MODULATION_DIVISOR : COMMISSIONING_MODULATION_DIVISOR;
+  const uint16_t deviation = (uint16_t)(TIM1->ARR / divisor);
   const uint16_t minimum = (uint16_t)(neutral - deviation);
   const uint16_t maximum = (uint16_t)(neutral + deviation);
   if (compare < minimum) {
@@ -273,6 +534,7 @@ static void set_compare_values(uint16_t a, uint16_t b, uint16_t c)
 void power_stage_disable(void)
 {
   current_foc_active = false;
+  current_foc_id_target = 0.0F;
   current_foc_iq_target = 0.0F;
   /* Gate all timer outputs before changing the individual channel enables. */
   TIM1->BDTR &= ~TIM_BDTR_MOE;
@@ -318,6 +580,7 @@ bool power_stage_init(void)
   test_sensor_invalid_count = 0U;
   current_foc_active = false;
   reset_test_current_statistics();
+  reset_inductance_statistics();
   test_steps_completed = 0U;
   test_settle_started_at = 0U;
   overcurrent_count = 0U;
@@ -381,22 +644,136 @@ void power_stage_process(void)
 
   if ((test_state == POWER_STAGE_TEST_RUNNING) &&
       (test_kind == TEST_KIND_RESISTANCE)) {
-    const uint32_t elapsed = (uint32_t)(now - test_started_at);
-    if ((stage_state != POWER_STAGE_RUNNING) ||
-        (elapsed >= RESISTANCE_TEST_END_MS)) {
+    const uint32_t phase_elapsed =
+        (uint32_t)(now - resistance_phase_started_at);
+    if ((uint32_t)(now - test_started_at) >= RESISTANCE_TIMEOUT_MS) {
       power_stage_disable();
-      test_state = elapsed >= RESISTANCE_TEST_END_MS ?
-          POWER_STAGE_TEST_COMPLETED : POWER_STAGE_TEST_ABORTED;
+      test_state = POWER_STAGE_TEST_ABORTED;
       test_kind = TEST_KIND_NONE;
-    } else if (elapsed < RESISTANCE_RAMP_UP_MS) {
-      current_foc_iq_target = RESISTANCE_MEASUREMENT_TARGET_AMPS *
-          (float)elapsed / (float)RESISTANCE_RAMP_UP_MS;
-    } else if (elapsed < RESISTANCE_SAMPLE_END_MS) {
-      current_foc_iq_target = RESISTANCE_MEASUREMENT_TARGET_AMPS;
+    } else if ((resistance_phase != RESISTANCE_PHASE_OFFSET_CALIBRATION) &&
+        (resistance_phase != RESISTANCE_PHASE_ENABLE_PENDING) &&
+        (stage_state != POWER_STAGE_RUNNING)) {
+      power_stage_disable();
+      test_state = POWER_STAGE_TEST_ABORTED;
+      test_kind = TEST_KIND_NONE;
     } else {
-      current_foc_iq_target = RESISTANCE_MEASUREMENT_TARGET_AMPS *
-          (float)(RESISTANCE_TEST_END_MS - elapsed) /
-          (float)(RESISTANCE_TEST_END_MS - RESISTANCE_SAMPLE_END_MS);
+      switch (resistance_phase) {
+      case RESISTANCE_PHASE_OFFSET_CALIBRATION:
+        break;
+      case RESISTANCE_PHASE_ENABLE_PENDING: {
+        const uint16_t neutral = (uint16_t)(TIM1->ARR / 2U);
+        if (!power_stage_enable(neutral, neutral, neutral)) {
+          test_state = POWER_STAGE_TEST_ABORTED;
+          test_kind = TEST_KIND_NONE;
+          break;
+        }
+        current_foc_active = true;
+        resistance_phase = RESISTANCE_PHASE_FORWARD_RAMP;
+        resistance_phase_started_at = now;
+        break;
+      }
+      case RESISTANCE_PHASE_FORWARD_RAMP:
+        current_foc_id_target = RESISTANCE_MEASUREMENT_TARGET_AMPS *
+            (float)phase_elapsed / (float)RESISTANCE_RAMP_MS;
+        if (phase_elapsed >= RESISTANCE_RAMP_MS) {
+          current_foc_id_target = RESISTANCE_MEASUREMENT_TARGET_AMPS;
+          resistance_phase = RESISTANCE_PHASE_FORWARD_SETTLE;
+          resistance_phase_started_at = now;
+        }
+        break;
+      case RESISTANCE_PHASE_FORWARD_SETTLE:
+        current_foc_id_target = RESISTANCE_MEASUREMENT_TARGET_AMPS;
+        if (phase_elapsed >= RESISTANCE_SETTLE_MS) {
+          resistance_phase = RESISTANCE_PHASE_FORWARD_SAMPLE;
+          resistance_phase_started_at = now;
+        }
+        break;
+      case RESISTANCE_PHASE_FORWARD_SAMPLE:
+        current_foc_id_target = RESISTANCE_MEASUREMENT_TARGET_AMPS;
+        if (phase_elapsed >= RESISTANCE_SAMPLE_MS) {
+          current_foc_id_target = 0.0F;
+          resistance_phase = RESISTANCE_PHASE_ZERO_SETTLE;
+          resistance_phase_started_at = now;
+        }
+        break;
+      case RESISTANCE_PHASE_ZERO_SETTLE:
+        current_foc_id_target = 0.0F;
+        if (phase_elapsed >= RESISTANCE_ZERO_MS) {
+          current_foc_integral_d = 0.0F;
+          current_foc_integral_q = 0.0F;
+          resistance_phase = RESISTANCE_PHASE_REVERSE_RAMP;
+          resistance_phase_started_at = now;
+        }
+        break;
+      case RESISTANCE_PHASE_REVERSE_RAMP:
+        current_foc_id_target = -RESISTANCE_MEASUREMENT_TARGET_AMPS *
+            (float)phase_elapsed / (float)RESISTANCE_RAMP_MS;
+        if (phase_elapsed >= RESISTANCE_RAMP_MS) {
+          current_foc_id_target = -RESISTANCE_MEASUREMENT_TARGET_AMPS;
+          resistance_phase = RESISTANCE_PHASE_REVERSE_SETTLE;
+          resistance_phase_started_at = now;
+        }
+        break;
+      case RESISTANCE_PHASE_REVERSE_SETTLE:
+        current_foc_id_target = -RESISTANCE_MEASUREMENT_TARGET_AMPS;
+        if (phase_elapsed >= RESISTANCE_SETTLE_MS) {
+          resistance_phase = RESISTANCE_PHASE_REVERSE_SAMPLE;
+          resistance_phase_started_at = now;
+        }
+        break;
+      case RESISTANCE_PHASE_REVERSE_SAMPLE:
+        current_foc_id_target = -RESISTANCE_MEASUREMENT_TARGET_AMPS;
+        if (phase_elapsed >= RESISTANCE_SAMPLE_MS) {
+          resistance_phase = RESISTANCE_PHASE_RAMP_DOWN;
+          resistance_phase_started_at = now;
+        }
+        break;
+      case RESISTANCE_PHASE_RAMP_DOWN:
+        current_foc_id_target = -RESISTANCE_MEASUREMENT_TARGET_AMPS *
+            (1.0F - (float)phase_elapsed / (float)RESISTANCE_RAMP_DOWN_MS);
+        if (phase_elapsed >= RESISTANCE_RAMP_DOWN_MS) {
+          current_foc_id_target = 0.0F;
+          finish_resistance_measurement();
+          resistance_phase = RESISTANCE_PHASE_COMPLETE;
+          power_stage_disable();
+          test_state = resistance_valid ? POWER_STAGE_TEST_COMPLETED :
+                                          POWER_STAGE_TEST_ABORTED;
+          test_kind = TEST_KIND_NONE;
+        }
+        break;
+      default:
+        break;
+      }
+    }
+  } else if ((test_state == POWER_STAGE_TEST_RUNNING) &&
+      (test_kind == TEST_KIND_INDUCTANCE)) {
+    if ((uint32_t)(now - test_started_at) >= INDUCTANCE_TIMEOUT_MS) {
+      power_stage_disable();
+      test_state = POWER_STAGE_TEST_ABORTED;
+      test_kind = TEST_KIND_NONE;
+    } else if (inductance_phase == INDUCTANCE_PHASE_ENABLE_PENDING) {
+      const uint16_t neutral = (uint16_t)(TIM1->ARR / 2U);
+      if (!power_stage_enable(neutral, neutral, neutral)) {
+        test_state = POWER_STAGE_TEST_ABORTED;
+        test_kind = TEST_KIND_NONE;
+      } else {
+        inductance_phase = INDUCTANCE_PHASE_PULSING;
+        inductance_tick = 0U;
+        inductance_half_periods = 0U;
+        inductance_direction = 1;
+        set_inductance_voltage(inductance_direction);
+      }
+    } else if (inductance_phase == INDUCTANCE_PHASE_COMPLETE) {
+      power_stage_disable();
+      test_state = inductance_valid ? POWER_STAGE_TEST_COMPLETED :
+                                      POWER_STAGE_TEST_ABORTED;
+      test_kind = TEST_KIND_NONE;
+    } else if ((inductance_phase !=
+                INDUCTANCE_PHASE_OFFSET_CALIBRATION) &&
+               (stage_state != POWER_STAGE_RUNNING)) {
+      power_stage_disable();
+      test_state = POWER_STAGE_TEST_ABORTED;
+      test_kind = TEST_KIND_NONE;
     }
   } else if ((test_state == POWER_STAGE_TEST_RUNNING) &&
       (test_kind == TEST_KIND_CURRENT_FOC)) {
@@ -571,7 +948,8 @@ void power_stage_process(void)
       set_voltage_vector(0U, (uint16_t)alignment_amplitude);
     }
   } else if ((test_state == POWER_STAGE_TEST_RUNNING) &&
-      (test_kind == TEST_KIND_ENCODER_VOLTAGE)) {
+      ((test_kind == TEST_KIND_ENCODER_VOLTAGE) ||
+       (test_kind == TEST_KIND_FLUX))) {
     const uint32_t elapsed = (uint32_t)(now - test_started_at);
     if ((stage_state != POWER_STAGE_RUNNING) ||
         (elapsed >= ENCODER_VOLTAGE_TIMEOUT_MS)) {
@@ -609,7 +987,11 @@ void power_stage_process(void)
           (uint32_t)(now - test_rotation_started_at);
       if (rotation_elapsed >= ENCODER_VOLTAGE_ROTATE_MS) {
         power_stage_disable();
-        test_state = POWER_STAGE_TEST_COMPLETED;
+        if (test_kind == TEST_KIND_FLUX) {
+          finish_flux_measurement();
+        }
+        test_state = (test_kind != TEST_KIND_FLUX || flux_valid) ?
+            POWER_STAGE_TEST_COMPLETED : POWER_STAGE_TEST_ABORTED;
         test_kind = TEST_KIND_NONE;
       } else {
         angle_sensor_sample_t sample;
@@ -625,16 +1007,19 @@ void power_stage_process(void)
           }
         } else {
           test_sensor_invalid_count = 0U;
+          const uint32_t target_dps = test_kind == TEST_KIND_FLUX ? 360U :
+              ENCODER_VOLTAGE_TARGET_DEGREES_PER_SECOND;
           const int32_t target_advance_counts = (int32_t)(
               ((uint64_t)rotation_elapsed * 4096U *
-               ENCODER_VOLTAGE_TARGET_DEGREES_PER_SECOND) / 360000U);
+               target_dps) / 360000U);
           const int32_t target_counts = test_start_position_counts +
               (test_direction > 0 ? target_advance_counts :
                                     -target_advance_counts);
           const int32_t error_counts = target_counts - sample.position_counts;
           const uint32_t absolute_error = (uint32_t)(
               error_counts < 0 ? -error_counts : error_counts);
-          uint32_t maximum_amplitude = TIM1->ARR / 12U;
+          uint32_t maximum_amplitude = test_kind == TEST_KIND_FLUX ?
+              TIM1->ARR / 3U : TIM1->ARR / 12U;
           if (rotation_elapsed >
               (ENCODER_VOLTAGE_ROTATE_MS - ENCODER_VOLTAGE_RAMP_DOWN_MS)) {
             maximum_amplitude = (maximum_amplitude *
@@ -658,6 +1043,24 @@ void power_stage_process(void)
           }
           set_voltage_vector(test_command_electrical_raw,
                              (uint16_t)amplitude);
+          if (test_kind == TEST_KIND_FLUX) {
+            const uint32_t outer_elapsed = current_foc_outer_last_ms == 0U ?
+                10U : (uint32_t)(now - current_foc_outer_last_ms);
+            if (outer_elapsed >= 5U) {
+              const float outer_dt = (float)outer_elapsed * 0.001F;
+              const float pll_error = (float)sample.position_counts -
+                  current_foc_pll_position_counts;
+              current_foc_pll_position_counts +=
+                  (current_foc_pll_speed_counts_per_second +
+                   CURRENT_FOC_PLL_KP_PER_SECOND * pll_error) * outer_dt;
+              current_foc_pll_speed_counts_per_second +=
+                  CURRENT_FOC_PLL_KI_PER_SECOND2 * pll_error * outer_dt;
+              current_foc_outer_last_ms = now;
+            }
+            flux_vq_mv = (int32_t)((int64_t)(error_counts >= 0 ?
+                (int32_t)amplitude : -(int32_t)amplitude) * bus_voltage_mv /
+                TIM1->ARR);
+          }
         }
       }
     }
@@ -912,7 +1315,6 @@ bool power_stage_start_current_foc_test(int8_t direction)
 
 bool power_stage_start_resistance_measurement(void)
 {
-  const uint16_t neutral = (uint16_t)(TIM1->ARR / 2U);
   if ((stage_state != POWER_STAGE_READY) || !bus_voltage_valid ||
       (bus_voltage_mv < COMMISSIONING_MIN_BUS_MV) ||
       (bus_voltage_mv > COMMISSIONING_MAX_BUS_MV) ||
@@ -925,16 +1327,61 @@ bool power_stage_start_resistance_measurement(void)
   reset_test_current_statistics();
   current_foc_integral_d = 0.0F;
   current_foc_integral_q = 0.0F;
+  current_foc_id_target = 0.0F;
   current_foc_iq_target = 0.0F;
-  current_foc_active = true;
+  current_foc_active = false;
   test_kind = TEST_KIND_RESISTANCE;
-  if (!power_stage_enable(neutral, neutral, neutral)) {
-    current_foc_active = false;
-    test_state = POWER_STAGE_TEST_ABORTED;
-    test_kind = TEST_KIND_NONE;
-    return false;
+  resistance_phase = RESISTANCE_PHASE_OFFSET_CALIBRATION;
+  resistance_phase_started_at = test_started_at;
+  calibration_count = 0U;
+  for (uint32_t phase = 0U; phase < 3U; ++phase) {
+    calibration_sum[phase] = 0U;
   }
   test_state = POWER_STAGE_TEST_RUNNING;
+  return true;
+}
+
+bool power_stage_start_inductance_measurement(void)
+{
+  if ((stage_state != POWER_STAGE_READY) || !bus_voltage_valid ||
+      (bus_voltage_mv < COMMISSIONING_MIN_BUS_MV) ||
+      (bus_voltage_mv > COMMISSIONING_MAX_BUS_MV) ||
+      (latched_faults != 0U) || !resistance_valid) {
+    return false;
+  }
+
+  reset_inductance_statistics();
+  overcurrent_count = 0U;
+  test_started_at = HAL_GetTick();
+  test_kind = TEST_KIND_INDUCTANCE;
+  inductance_phase = INDUCTANCE_PHASE_OFFSET_CALIBRATION;
+  calibration_count = 0U;
+  for (uint32_t phase = 0U; phase < 3U; ++phase) {
+    calibration_sum[phase] = 0U;
+  }
+  test_state = POWER_STAGE_TEST_RUNNING;
+  return true;
+}
+
+bool power_stage_start_flux_measurement(int8_t direction)
+{
+  const int32_t saved_resistance = resistance_average_milliohms;
+  const bool saved_resistance_valid = resistance_valid;
+  if (!saved_resistance_valid ||
+      !power_stage_start_encoder_voltage_test(direction)) {
+    return false;
+  }
+  /* The generic test reset clears prior diagnostics; retain the prerequisite Rs. */
+  resistance_average_milliohms = saved_resistance;
+  resistance_valid = true;
+  reset_flux_statistics();
+  angle_sensor_sample_t sample;
+  if (angle_sensor_get_sample(&sample)) {
+    current_foc_pll_position_counts = (float)sample.position_counts;
+  }
+  current_foc_pll_speed_counts_per_second = 0.0F;
+  current_foc_outer_last_ms = HAL_GetTick();
+  test_kind = TEST_KIND_FLUX;
   return true;
 }
 
@@ -1043,6 +1490,38 @@ bool power_stage_get_diagnostics(power_stage_diagnostics_t *diagnostics)
       resistance_measurement_samples;
   diagnostics->resistance_iq_sum_ma = resistance_iq_sum_ma;
   diagnostics->resistance_vq_sum_mv = resistance_vq_sum_mv;
+  diagnostics->resistance_phase = (uint8_t)resistance_phase;
+  diagnostics->resistance_valid = resistance_valid ? 1U : 0U;
+  diagnostics->resistance_forward_samples = resistance_forward_samples;
+  diagnostics->resistance_reverse_samples = resistance_reverse_samples;
+  diagnostics->resistance_id_ma = resistance_id_ma;
+  diagnostics->resistance_iq_ma = resistance_iq_ma;
+  diagnostics->resistance_vd_mv = resistance_vd_mv;
+  diagnostics->resistance_vq_mv = resistance_vq_mv;
+  diagnostics->resistance_live_milliohms = resistance_live_milliohms;
+  diagnostics->resistance_forward_milliohms =
+      resistance_forward_milliohms;
+  diagnostics->resistance_reverse_milliohms =
+      resistance_reverse_milliohms;
+  diagnostics->resistance_average_milliohms =
+      resistance_average_milliohms;
+  diagnostics->inductance_phase = (uint8_t)inductance_phase;
+  diagnostics->inductance_valid = inductance_valid ? 1U : 0U;
+  diagnostics->inductance_forward_samples = inductance_forward_samples;
+  diagnostics->inductance_reverse_samples = inductance_reverse_samples;
+  diagnostics->inductance_delta_current_ma = inductance_delta_current_ma;
+  diagnostics->inductance_voltage_mv = inductance_voltage_mv;
+  diagnostics->inductance_forward_uh = inductance_forward_uh;
+  diagnostics->inductance_reverse_uh = inductance_reverse_uh;
+  diagnostics->inductance_average_uh = inductance_average_uh;
+  diagnostics->flux_valid = flux_valid ? 1U : 0U;
+  diagnostics->flux_samples = flux_samples;
+  diagnostics->flux_speed_millidegrees_per_second = flux_speed_mdps;
+  diagnostics->flux_iq_ma = flux_iq_ma;
+  diagnostics->flux_vq_mv = flux_vq_mv;
+  diagnostics->flux_linkage_uwb = flux_linkage_uwb;
+  diagnostics->back_emf_constant_uv_per_rad_s = flux_ke_uv_per_rad_s;
+  diagnostics->kv_millirpm_per_volt = flux_kv_millirpm_per_volt;
   for (uint32_t phase = 0U; phase < 3U; ++phase) {
     diagnostics->test_current_sum[phase] = test_current_sum[phase];
     diagnostics->test_current_min[phase] = test_current_min[phase];
@@ -1071,7 +1550,28 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
   }
   ++current_sequence;
 
-  if (stage_state == POWER_STAGE_CALIBRATING) {
+  if ((test_state == POWER_STAGE_TEST_RUNNING) &&
+      (((test_kind == TEST_KIND_RESISTANCE) &&
+        (resistance_phase == RESISTANCE_PHASE_OFFSET_CALIBRATION)) ||
+       ((test_kind == TEST_KIND_INDUCTANCE) &&
+        (inductance_phase == INDUCTANCE_PHASE_OFFSET_CALIBRATION)))) {
+    for (uint32_t index = 0U; index < 3U; ++index) {
+      calibration_sum[index] += samples[index];
+    }
+    ++calibration_count;
+    if (calibration_count >= CURRENT_CALIBRATION_SAMPLES) {
+      for (uint32_t index = 0U; index < 3U; ++index) {
+        current_offset[index] = (uint16_t)(
+            calibration_sum[index] / CURRENT_CALIBRATION_SAMPLES);
+      }
+      if (test_kind == TEST_KIND_RESISTANCE) {
+        resistance_phase = RESISTANCE_PHASE_ENABLE_PENDING;
+        resistance_phase_started_at = HAL_GetTick();
+      } else {
+        inductance_phase = INDUCTANCE_PHASE_ENABLE_PENDING;
+      }
+    }
+  } else if (stage_state == POWER_STAGE_CALIBRATING) {
     for (uint32_t index = 0U; index < 3U; ++index) {
       calibration_sum[index] += samples[index];
     }
@@ -1086,6 +1586,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     }
   } else if (stage_state == POWER_STAGE_RUNNING) {
     bool overcurrent = false;
+    const int32_t current_trip_counts =
+        test_kind == TEST_KIND_INDUCTANCE ? 40 :
+        (int32_t)CURRENT_TRIP_ADC_COUNTS;
     int32_t balance = 0;
     int32_t centered_samples[3];
     for (uint32_t index = 0U; index < 3U; ++index) {
@@ -1100,8 +1603,8 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
       if (centered > test_current_max[index]) {
         test_current_max[index] = (int16_t)centered;
       }
-      if ((centered > (int32_t)CURRENT_TRIP_ADC_COUNTS) ||
-          (centered < -(int32_t)CURRENT_TRIP_ADC_COUNTS)) {
+      if ((centered > current_trip_counts) ||
+          (centered < -current_trip_counts)) {
         overcurrent = true;
       }
     }
@@ -1113,16 +1616,27 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     }
 
     const uint8_t transform_divider_limit =
-        (((test_kind == TEST_KIND_CURRENT_FOC) ||
-          (test_kind == TEST_KIND_RESISTANCE)) && current_foc_active) ?
+        ((((test_kind == TEST_KIND_CURRENT_FOC) ||
+           (test_kind == TEST_KIND_RESISTANCE)) && current_foc_active) ||
+         (test_kind == TEST_KIND_FLUX) ||
+         (test_kind == TEST_KIND_INDUCTANCE)) ?
         1U : CURRENT_TRANSFORM_DIAGNOSTIC_DIVIDER;
     if ((((test_kind == TEST_KIND_ENCODER_VOLTAGE) &&
           (test_rotation_started_at != 0U)) ||
          (((test_kind == TEST_KIND_CURRENT_FOC) ||
-           (test_kind == TEST_KIND_RESISTANCE)) && current_foc_active)) &&
+           (test_kind == TEST_KIND_RESISTANCE)) && current_foc_active) ||
+         (test_kind == TEST_KIND_FLUX) ||
+         (test_kind == TEST_KIND_INDUCTANCE)) &&
         (++test_transform_divider >= transform_divider_limit)) {
       test_transform_divider = 0U;
-      const bool is_v7 = (TIM1->CR1 & TIM_CR1_DIR) == 0U;
+      /*
+       * The resistance vector is stationary and ADC sampling is near ARR.
+       * With low-side shunts, the phase with the largest compare is the one
+       * that can be unobservable at that instant, on both counter directions.
+       */
+      const bool is_v7 = (test_kind != TEST_KIND_RESISTANCE) &&
+          (test_kind != TEST_KIND_INDUCTANCE) &&
+          ((TIM1->CR1 & TIM_CR1_DIR) == 0U);
       uint32_t reconstructed_phase = 3U;
       int32_t corrected[3] = {
           centered_samples[0], centered_samples[1], centered_samples[2]};
@@ -1160,14 +1674,32 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
       }
 
       uint16_t electrical_raw;
-      const bool angle_valid = test_kind == TEST_KIND_RESISTANCE ?
+      const bool fixed_identification_angle =
+          (test_kind == TEST_KIND_RESISTANCE) ||
+          (test_kind == TEST_KIND_INDUCTANCE);
+      const bool angle_valid = fixed_identification_angle ?
           ((electrical_raw = 0U), true) :
           angle_sensor_get_electrical_raw_fast(&electrical_raw);
       if (angle_valid) {
-        const float ia = (float)corrected[0] * CURRENT_ADC_TO_AMPS;
-        const float ib = (float)corrected[1] * CURRENT_ADC_TO_AMPS;
-        const float i_alpha = ia;
-        const float i_beta = 0.577350269F * ia + 1.154700538F * ib;
+        const bool stationary_identification =
+            (test_kind == TEST_KIND_RESISTANCE) ||
+            (test_kind == TEST_KIND_INDUCTANCE);
+        const bool inline_identification = stationary_identification ||
+            (test_kind == TEST_KIND_FLUX);
+        const float current_scale = inline_identification ?
+            -CURRENT_ADC_TO_AMPS : CURRENT_ADC_TO_AMPS;
+        const int32_t *transform_samples = inline_identification ?
+            centered_samples : corrected;
+        const float ia = (float)transform_samples[0] * current_scale;
+        const float ib = (float)transform_samples[1] * current_scale;
+        const float ic = (float)transform_samples[2] * current_scale;
+        /* Full Clarke rejects ADC common-mode error on the three inline shunts. */
+        const float i_alpha = inline_identification ?
+            (0.666666667F * ia - 0.333333333F * ib - 0.333333333F * ic) :
+            ia;
+        const float i_beta = inline_identification ?
+            (0.577350269F * (ib - ic)) :
+            (0.577350269F * ia + 1.154700538F * ib);
         const float sine = fast_sine_raw(electrical_raw);
         const float cosine = fast_sine_raw((uint16_t)(electrical_raw + 1024U));
         const float id = cosine * i_alpha + sine * i_beta;
@@ -1182,8 +1714,79 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         if (iq_ma < test_iq_min_ma) { test_iq_min_ma = iq_ma; }
         if (iq_ma > test_iq_max_ma) { test_iq_max_ma = iq_ma; }
 
+        if ((test_kind == TEST_KIND_INDUCTANCE) &&
+            (inductance_phase == INDUCTANCE_PHASE_PULSING)) {
+          if (inductance_tick >= INDUCTANCE_HALF_PERIOD_TICKS -
+                                 INDUCTANCE_ENDPOINT_AVERAGE_TICKS) {
+            inductance_baseline_sum_ma += id_ma;
+            ++inductance_baseline_samples;
+          }
+          if (inductance_tick >= INDUCTANCE_HALF_PERIOD_TICKS - 1U) {
+            const int32_t endpoint_ma = inductance_baseline_samples == 0U ? 0 :
+                (int32_t)(inductance_baseline_sum_ma /
+                          inductance_baseline_samples);
+            const int32_t normalized_current_ma =
+                endpoint_ma * inductance_direction;
+            const int32_t voltage_mv = (int32_t)(
+                ((uint64_t)(TIM1->ARR / 6U) * bus_voltage_mv) / TIM1->ARR);
+            inductance_delta_current_ma = normalized_current_ma;
+            inductance_voltage_mv = voltage_mv;
+            if ((inductance_half_periods >=
+                 INDUCTANCE_SETTLE_HALF_PERIODS) &&
+                (normalized_current_ma > 20)) {
+              if (inductance_direction > 0) {
+                ++inductance_forward_samples;
+                inductance_forward_delta_sum_ma += normalized_current_ma;
+                inductance_forward_voltage_sum_mv += voltage_mv;
+              } else {
+                ++inductance_reverse_samples;
+                inductance_reverse_delta_sum_ma += normalized_current_ma;
+                inductance_reverse_voltage_sum_mv += voltage_mv;
+              }
+            }
+            if ((inductance_forward_samples >=
+                 INDUCTANCE_TARGET_SAMPLES_PER_DIRECTION) &&
+                (inductance_reverse_samples >=
+                 INDUCTANCE_TARGET_SAMPLES_PER_DIRECTION)) {
+              finish_inductance_measurement();
+              inductance_phase = INDUCTANCE_PHASE_COMPLETE;
+              set_inductance_voltage(0);
+            } else {
+              inductance_tick = 0U;
+              ++inductance_half_periods;
+              inductance_direction = (int8_t)-inductance_direction;
+              inductance_baseline_sum_ma = 0;
+              inductance_baseline_samples = 0U;
+              set_inductance_voltage(inductance_direction);
+            }
+          } else {
+            ++inductance_tick;
+          }
+        }
+
+        if (test_kind == TEST_KIND_FLUX) {
+          const int32_t speed_mdps = (int32_t)(
+              current_foc_pll_speed_counts_per_second *
+              (360000.0F / 4096.0F));
+          flux_speed_mdps = speed_mdps;
+          flux_iq_ma = iq_ma;
+          const uint32_t rotation_elapsed =
+              (uint32_t)(HAL_GetTick() - test_rotation_started_at);
+          const bool speed_valid = test_direction > 0 ?
+              (speed_mdps > 300000 && speed_mdps < 420000) :
+              (speed_mdps < -300000 && speed_mdps > -420000);
+          if ((rotation_elapsed >= FLUX_SAMPLE_START_MS) &&
+              (rotation_elapsed < FLUX_SAMPLE_END_MS) && speed_valid) {
+            ++flux_samples;
+            flux_speed_sum_mdps += speed_mdps;
+            flux_iq_sum_ma += iq_ma;
+            flux_vq_sum_mv += flux_vq_mv;
+          }
+        }
+
         if (((test_kind == TEST_KIND_CURRENT_FOC) ||
              (test_kind == TEST_KIND_RESISTANCE)) && current_foc_active) {
+          const float id_target = current_foc_id_target;
           const float iq_target = current_foc_iq_target;
           const int32_t iq_target_ma = (int32_t)(1000.0F * iq_target);
           test_iq_target_sum_ma += iq_target_ma;
@@ -1193,18 +1796,21 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
           if (iq_target_ma > test_iq_target_max_ma) {
             test_iq_target_max_ma = iq_target_ma;
           }
-          const float error_d = -id;
+          const float error_d = id_target - id;
           const float error_q = iq_target - iq;
           const float voltage_limit_counts =
               (float)(TIM1->ARR /
                   (test_kind == TEST_KIND_RESISTANCE ?
-                       COMMISSIONING_MODULATION_DIVISOR :
+                       RESISTANCE_MODULATION_DIVISOR :
                        CURRENT_FOC_MODULATION_DIVISOR));
 
-          current_foc_integral_d += error_d *
-              CURRENT_FOC_KI_COUNTS_PER_AMP_SECOND * CURRENT_FOC_DT_SECONDS;
-          current_foc_integral_q += error_q *
-              CURRENT_FOC_KI_COUNTS_PER_AMP_SECOND * CURRENT_FOC_DT_SECONDS;
+          const float current_ki = test_kind == TEST_KIND_RESISTANCE ?
+              RESISTANCE_FOC_KI_COUNTS_PER_AMP_SECOND :
+              CURRENT_FOC_KI_COUNTS_PER_AMP_SECOND;
+          current_foc_integral_d += error_d * current_ki *
+              CURRENT_FOC_DT_SECONDS;
+          current_foc_integral_q += error_q * current_ki *
+              CURRENT_FOC_DT_SECONDS;
           if (current_foc_integral_d > voltage_limit_counts) {
             ++test_integral_d_saturated_samples;
             current_foc_integral_d = voltage_limit_counts;
@@ -1241,15 +1847,29 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
           }
 
           if (test_kind == TEST_KIND_RESISTANCE) {
-            const uint32_t measurement_elapsed =
-                (uint32_t)(HAL_GetTick() - test_started_at);
-            if ((measurement_elapsed >= RESISTANCE_SETTLE_END_MS) &&
-                (measurement_elapsed < RESISTANCE_SAMPLE_END_MS)) {
-              const int32_t applied_vq_mv = (int32_t)(
-                  voltage_q * (float)bus_voltage_mv / (float)TIM1->ARR);
+            const int32_t applied_vd_mv = (int32_t)(
+                voltage_d * (float)bus_voltage_mv / (float)TIM1->ARR);
+            const int32_t applied_vq_mv = (int32_t)(
+                voltage_q * (float)bus_voltage_mv / (float)TIM1->ARR);
+            resistance_id_ma = id_ma;
+            resistance_iq_ma = iq_ma;
+            resistance_vd_mv = applied_vd_mv;
+            resistance_vq_mv = applied_vq_mv;
+            resistance_live_milliohms =
+                ((id_ma > 20) || (id_ma < -20)) ?
+                    (applied_vd_mv * 1000) / id_ma : 0;
+            if (resistance_phase == RESISTANCE_PHASE_FORWARD_SAMPLE) {
+              ++resistance_forward_samples;
+              resistance_forward_id_sum_ma += id_ma;
+              resistance_forward_vd_sum_mv += applied_vd_mv;
+              /* Preserve the old fields and offsets for protocol compatibility. */
               ++resistance_measurement_samples;
-              resistance_iq_sum_ma += iq_ma;
-              resistance_vq_sum_mv += applied_vq_mv;
+              resistance_iq_sum_ma += id_ma;
+              resistance_vq_sum_mv += applied_vd_mv;
+            } else if (resistance_phase == RESISTANCE_PHASE_REVERSE_SAMPLE) {
+              ++resistance_reverse_samples;
+              resistance_reverse_id_sum_ma += id_ma;
+              resistance_reverse_vd_sum_mv += applied_vd_mv;
             }
           }
 

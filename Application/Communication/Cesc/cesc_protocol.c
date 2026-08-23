@@ -52,6 +52,8 @@ enum {
     MOTOR_START_ENCODER_VOLTAGE_TEST = 0x04,
     MOTOR_START_CURRENT_FOC_TEST = 0x05,
     MOTOR_MEASURE_RESISTANCE = 0x06,
+    MOTOR_MEASURE_INDUCTANCE = 0x07,
+    MOTOR_MEASURE_FLUX = 0x08,
     TELEMETRY_ENUM_CHANNELS = 0x00,
     TELEMETRY_SUBSCRIBE = 0x01,
     TELEMETRY_UNSUBSCRIBE = 0x02,
@@ -700,6 +702,35 @@ static void motor_service(uint8_t command, uint16_t sequence,
         write_u32(&response_buffer[index], diagnostics.resistance_measurement_samples); index += 4U;
         write_u64(&response_buffer[index], (uint64_t)diagnostics.resistance_iq_sum_ma); index += 8U;
         write_u64(&response_buffer[index], (uint64_t)diagnostics.resistance_vq_sum_mv); index += 8U;
+        response_buffer[index++] = diagnostics.resistance_phase;
+        response_buffer[index++] = diagnostics.resistance_valid;
+        write_u32(&response_buffer[index], diagnostics.resistance_forward_samples); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.resistance_reverse_samples); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_id_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_iq_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_vd_mv); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_vq_mv); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_live_milliohms); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_forward_milliohms); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_reverse_milliohms); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.resistance_average_milliohms); index += 4U;
+        response_buffer[index++] = diagnostics.inductance_phase;
+        response_buffer[index++] = diagnostics.inductance_valid;
+        write_u32(&response_buffer[index], diagnostics.inductance_forward_samples); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.inductance_reverse_samples); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.inductance_delta_current_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.inductance_voltage_mv); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.inductance_forward_uh); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.inductance_reverse_uh); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.inductance_average_uh); index += 4U;
+        response_buffer[index++] = diagnostics.flux_valid;
+        write_u32(&response_buffer[index], diagnostics.flux_samples); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.flux_speed_millidegrees_per_second); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.flux_iq_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.flux_vq_mv); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.flux_linkage_uwb); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.back_emf_constant_uv_per_rad_s); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.kv_millirpm_per_volt); index += 4U;
         send_response(SERVICE_MOTOR, command, sequence, STATUS_OK,
                       (uint16_t)(index - 2U));
         return;
@@ -743,6 +774,22 @@ static void motor_service(uint8_t command, uint16_t sequence,
     case MOTOR_MEASURE_RESISTANCE:
         if (length != 0U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
         if (!power_stage_start_resistance_measurement()) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_MEASURE_INDUCTANCE:
+        if (length != 0U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_start_inductance_measurement()) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_MEASURE_FLUX:
+        if (length != 1U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_start_flux_measurement((int8_t)payload[0])) {
             send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
             return;
         }

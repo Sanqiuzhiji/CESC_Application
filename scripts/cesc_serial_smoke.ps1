@@ -7,6 +7,8 @@ param(
     [switch]$RunEncoderVoltageTest,
     [switch]$RunCurrentFocTest,
     [switch]$RunResistanceTest,
+    [switch]$RunInductanceTest,
+    [switch]$RunFluxTest,
     [ValidateSet(-1, 1)]
     [int]$CommissioningDirection = 1
 )
@@ -147,32 +149,116 @@ try {
         [int]($RunCommissioningTest.IsPresent) +
         [int]($RunEncoderVoltageTest.IsPresent) +
         [int]($RunCurrentFocTest.IsPresent) +
-        [int]($RunResistanceTest.IsPresent)
+        [int]($RunResistanceTest.IsPresent) +
+        [int]($RunInductanceTest.IsPresent) +
+        [int]($RunFluxTest.IsPresent)
     if ($selectedMotorTests -gt 1) {
         throw "Select only one motor test per invocation"
     }
-    if ($RunResistanceTest) {
+    if ($RunResistanceTest -or $RunInductanceTest -or $RunFluxTest) {
         [void](Assert-CescResponse (Send-CescRequest $port 5 6 $nextSequence ([byte[]]@())) 5 6 $nextSequence)
         ++$nextSequence
-        Start-Sleep -Milliseconds 2800
-        $powerAfter = Assert-CescResponse (Send-CescRequest $port 5 0 $nextSequence ([byte[]]@())) 5 0 $nextSequence
-        ++$nextSequence
+        $deadline = [DateTime]::UtcNow.AddSeconds(8)
+        do {
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            $testStateNow = [int]$powerAfter[38]
+            $phase = [int]$powerAfter[204]
+            $valid = [int]$powerAfter[205]
+            $forwardSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[206..209], 0)
+            $reverseSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[210..213], 0)
+            $idMa = [BitConverter]::ToInt32([byte[]]$powerAfter[214..217], 0)
+            $iqMa = [BitConverter]::ToInt32([byte[]]$powerAfter[218..221], 0)
+            $vdMv = [BitConverter]::ToInt32([byte[]]$powerAfter[222..225], 0)
+            $vqMv = [BitConverter]::ToInt32([byte[]]$powerAfter[226..229], 0)
+            $liveMilliohms = [BitConverter]::ToInt32([byte[]]$powerAfter[230..233], 0)
+            $forwardMilliohms = [BitConverter]::ToInt32([byte[]]$powerAfter[234..237], 0)
+            $reverseMilliohms = [BitConverter]::ToInt32([byte[]]$powerAfter[238..241], 0)
+            $averageMilliohms = [BitConverter]::ToInt32([byte[]]$powerAfter[242..245], 0)
+            $adcCurrent = for ($phaseIndex = 0; $phaseIndex -lt 3; ++$phaseIndex) {
+                [BitConverter]::ToInt32([byte[]]$powerAfter[(18 + 8 * $phaseIndex)..(21 + 8 * $phaseIndex)], 0)
+            }
+            Write-Output ("Resistance phase={0} Id={1:F3}A Iq={2:F3}A Vd={3:F3}V Vq={4:F3}V ADC=[{5}] R={6:F3}ohm samples={7}/{8}" -f
+                $phase, ($idMa / 1000.0), ($iqMa / 1000.0), ($vdMv / 1000.0),
+                ($vqMv / 1000.0), ($adcCurrent -join ','), ($liveMilliohms / 1000.0),
+                $forwardSamples, $reverseSamples)
+        } while ($testStateNow -eq 1 -and [DateTime]::UtcNow -lt $deadline)
         $stateAfter = [int]$powerAfter[0]
         $flagsAfter = [int]$powerAfter[1]
         $faultsAfter = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
         $testState = [int]$powerAfter[38]
-        $resistanceSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[184..187], 0)
-        $resistanceIqSumMa = [BitConverter]::ToInt64([byte[]]$powerAfter[188..195], 0)
-        $resistanceVqSumMv = [BitConverter]::ToInt64([byte[]]$powerAfter[196..203], 0)
-        $resistanceIqAverageA = if ($resistanceSamples -gt 0) { $resistanceIqSumMa / (1000.0 * $resistanceSamples) } else { 0.0 }
-        $resistanceVqAverageV = if ($resistanceSamples -gt 0) { $resistanceVqSumMv / (1000.0 * $resistanceSamples) } else { 0.0 }
-        $resistanceOhms = if ([Math]::Abs($resistanceIqAverageA) -gt 0.02) { $resistanceVqAverageV / $resistanceIqAverageA } else { 0.0 }
         if ($stateAfter -ne 2 -or ($flagsAfter -band 0x03) -ne 0 -or
             $faultsAfter -ne 0 -or $testState -ne 2 -or
-            $resistanceSamples -lt 1000 -or $resistanceOhms -le 0.0) {
-            throw "Resistance measurement failed state=$stateAfter flags=$flagsAfter faults=$faultsAfter testState=$testState samples=$resistanceSamples iqA=$resistanceIqAverageA vqV=$resistanceVqAverageV resistanceOhm=$resistanceOhms"
+            $valid -ne 1 -or $forwardSamples -lt 1000 -or $reverseSamples -lt 1000 -or
+            $forwardMilliohms -le 0 -or $reverseMilliohms -le 0 -or $averageMilliohms -le 0) {
+            throw "Resistance measurement failed state=$stateAfter flags=$flagsAfter faults=$faultsAfter testState=$testState valid=$valid samples=$forwardSamples/$reverseSamples resistanceMilliohms=$forwardMilliohms/$reverseMilliohms/$averageMilliohms"
         }
-        $motorResult = "resistance samples=$resistanceSamples iqAvgA=$resistanceIqAverageA vqAvgV=$resistanceVqAverageV phaseResistanceOhm=$resistanceOhms"
+        $motorResult = "resistance samples=$forwardSamples/$reverseSamples forwardOhm=$($forwardMilliohms / 1000.0) reverseOhm=$($reverseMilliohms / 1000.0) phaseResistanceOhm=$($averageMilliohms / 1000.0)"
+    }
+    if ($RunInductanceTest) {
+        [void](Assert-CescResponse (Send-CescRequest $port 5 7 $nextSequence ([byte[]]@())) 5 7 $nextSequence)
+        ++$nextSequence
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            $testStateNow = [int]$powerAfter[38]
+            $inductancePhase = [int]$powerAfter[246]
+            $inductanceValid = [int]$powerAfter[247]
+            $inductanceForwardSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[248..251], 0)
+            $inductanceReverseSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[252..255], 0)
+            $deltaCurrentMa = [BitConverter]::ToInt32([byte[]]$powerAfter[256..259], 0)
+            $inductiveVoltageMv = [BitConverter]::ToInt32([byte[]]$powerAfter[260..263], 0)
+            $forwardUh = [BitConverter]::ToUInt32([byte[]]$powerAfter[264..267], 0)
+            $reverseUh = [BitConverter]::ToUInt32([byte[]]$powerAfter[268..271], 0)
+            $averageUh = [BitConverter]::ToUInt32([byte[]]$powerAfter[272..275], 0)
+            Write-Output ("Inductance phase={0} dI={1:F3}A Vind={2:F3}V samples={3}/{4} L={5}/{6}/{7}uH" -f
+                $inductancePhase, ($deltaCurrentMa / 1000.0), ($inductiveVoltageMv / 1000.0),
+                $inductanceForwardSamples, $inductanceReverseSamples, $forwardUh, $reverseUh, $averageUh)
+        } while ($testStateNow -eq 1 -and [DateTime]::UtcNow -lt $deadline)
+        $stateAfter = [int]$powerAfter[0]
+        $flagsAfter = [int]$powerAfter[1]
+        $faultsAfter = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+        $testState = [int]$powerAfter[38]
+        if ($stateAfter -ne 2 -or ($flagsAfter -band 0x03) -ne 0 -or
+            $faultsAfter -ne 0 -or $testState -ne 2 -or $inductanceValid -ne 1) {
+            throw "Inductance measurement failed state=$stateAfter flags=$flagsAfter faults=$faultsAfter testState=$testState valid=$inductanceValid samples=$inductanceForwardSamples/$inductanceReverseSamples L_uH=$forwardUh/$reverseUh/$averageUh"
+        }
+        $motorResult += " inductance samples=$inductanceForwardSamples/$inductanceReverseSamples forwardUh=$forwardUh reverseUh=$reverseUh phaseInductanceUh=$averageUh"
+    }
+    if ($RunFluxTest) {
+        [byte]$directionByte = if ($CommissioningDirection -gt 0) { 1 } else { 255 }
+        [void](Assert-CescResponse (Send-CescRequest $port 5 8 $nextSequence ([byte[]]@($directionByte))) 5 8 $nextSequence)
+        ++$nextSequence
+        $deadline = [DateTime]::UtcNow.AddSeconds(12)
+        do {
+            Start-Sleep -Milliseconds 200
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            $testStateNow = [int]$powerAfter[38]
+            $fluxValid = [int]$powerAfter[276]
+            $fluxSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[277..280], 0)
+            $speedMdps = [BitConverter]::ToInt32([byte[]]$powerAfter[281..284], 0)
+            $fluxIqMa = [BitConverter]::ToInt32([byte[]]$powerAfter[285..288], 0)
+            $fluxVqMv = [BitConverter]::ToInt32([byte[]]$powerAfter[289..292], 0)
+            $linkageUwb = [BitConverter]::ToUInt32([byte[]]$powerAfter[293..296], 0)
+            $keUv = [BitConverter]::ToUInt32([byte[]]$powerAfter[297..300], 0)
+            $kvMilli = [BitConverter]::ToUInt32([byte[]]$powerAfter[301..304], 0)
+            Write-Output ("Flux speed={0:F2}dps Iq={1:F3}A Vq={2:F3}V samples={3} lambda={4:F6}Wb Ke={5:F6}V/(rad/s) KV={6:F2}rpm/V" -f
+                ($speedMdps / 1000.0), ($fluxIqMa / 1000.0), ($fluxVqMv / 1000.0),
+                $fluxSamples, ($linkageUwb / 1000000.0), ($keUv / 1000000.0), ($kvMilli / 1000.0))
+        } while ($testStateNow -eq 1 -and [DateTime]::UtcNow -lt $deadline)
+        $stateAfter = [int]$powerAfter[0]
+        $flagsAfter = [int]$powerAfter[1]
+        $faultsAfter = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+        $testState = [int]$powerAfter[38]
+        if ($stateAfter -ne 2 -or ($flagsAfter -band 0x03) -ne 0 -or
+            $faultsAfter -ne 0 -or $testState -ne 2 -or $fluxValid -ne 1) {
+            throw "Flux measurement failed state=$stateAfter flags=$flagsAfter faults=$faultsAfter testState=$testState valid=$fluxValid samples=$fluxSamples"
+        }
+        $motorResult += " flux samples=$fluxSamples lambdaWb=$($linkageUwb / 1000000.0) Ke=$($keUv / 1000000.0) KV=$($kvMilli / 1000.0)"
     }
     if ($RunEncoderVoltageTest -or $RunCurrentFocTest) {
         [byte]$directionByte = if ($CommissioningDirection -gt 0) { 1 } else { 255 }
