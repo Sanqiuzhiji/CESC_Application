@@ -52,6 +52,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Application/Devices/AngleSensor/angle_sensor.c
     Application/Devices/AngleSensor/as5600.c
     Application/Devices/GateDriver/drv8301.c
+    Application/MotorControl/Control/motor_control_config.c
+    Application/MotorControl/FOC/foc.c
     Application/MotorControl/PowerStage/power_stage.c
     Application/Services/FirmwareUpdate/firmware_update.c
 )
@@ -60,6 +62,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # rest of the firmware is built with Debug symbols and -O0 for source-level
 # debugging. Keep -g globally, but compile this translation unit optimized.
 set_source_files_properties(
+    Application/MotorControl/FOC/foc.c
     Application/MotorControl/PowerStage/power_stage.c
     PROPERTIES COMPILE_OPTIONS "-O2"
 )
@@ -71,6 +74,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Application/Communication/Usb
     Application/Devices/AngleSensor
     Application/Devices/GateDriver
+    Application/MotorControl/Control
+    Application/MotorControl/FOC
     Application/MotorControl/PowerStage
     Application/Services/FirmwareUpdate
 )

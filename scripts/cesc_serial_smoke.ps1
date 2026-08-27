@@ -6,9 +6,40 @@ param(
     [switch]$RunEncoderAlignment,
     [switch]$RunEncoderVoltageTest,
     [switch]$RunCurrentFocTest,
+    [switch]$RunIqCurrentTest,
+    [switch]$RunSpeedTest,
+    [switch]$RunPositionTest,
+    [switch]$RunPositionProfileTest,
+    [switch]$RunHapticTest,
+    [switch]$RunTorqueTest,
     [switch]$RunResistanceTest,
     [switch]$RunInductanceTest,
     [switch]$RunFluxTest,
+    [ValidateRange(-300, 300)]
+    [int]$IqCurrentMa = 50,
+    [ValidateRange(500, 5000)]
+    [int]$IqDurationMs = 800,
+    [switch]$VerifyIqWatchdog,
+    [ValidateRange(-45000, 45000)]
+    [int]$SpeedTargetMdps = 2000,
+    [ValidateRange(20, 300)]
+    [int]$SpeedSamples = 20,
+    [ValidateRange(-10000, 10000)]
+    [int]$RelativePositionTargetMdeg = 5000,
+    [ValidateRange(50, 45000)]
+    [int]$PositionProfileSpeedMdps = 10000,
+    [ValidateRange(100, 90000)]
+    [int]$PositionProfileAccelerationMdps2 = 10000,
+    [ValidateRange(100, 90000)]
+    [int]$PositionProfileDecelerationMdps2 = 10000,
+    [ValidateRange(100, 360000)]
+    [int]$HapticDetentSpacingMdeg = 15000,
+    [ValidateRange(0, 300)]
+    [int]$HapticDetentStrengthMa = 100,
+    [ValidateRange(0, 100)]
+    [int]$HapticDampingMaPerDps = 10,
+    [ValidateRange(-69, 69)]
+    [int]$TorqueTargetMnm = 12,
     [ValidateSet(-1, 1)]
     [int]$CommissioningDirection = 1
 )
@@ -149,11 +180,322 @@ try {
         [int]($RunCommissioningTest.IsPresent) +
         [int]($RunEncoderVoltageTest.IsPresent) +
         [int]($RunCurrentFocTest.IsPresent) +
+        [int]($RunIqCurrentTest.IsPresent) +
+        [int]($RunSpeedTest.IsPresent) +
+        [int]($RunPositionTest.IsPresent) +
+        [int]($RunPositionProfileTest.IsPresent) +
+        [int]($RunHapticTest.IsPresent) +
+        [int]($RunTorqueTest.IsPresent) +
         [int]($RunResistanceTest.IsPresent) +
         [int]($RunInductanceTest.IsPresent) +
         [int]($RunFluxTest.IsPresent)
     if ($selectedMotorTests -gt 1) {
         throw "Select only one motor test per invocation"
+    }
+    if ($RunIqCurrentTest) {
+        if ([Math]::Abs($IqCurrentMa) -lt 10) {
+            throw "IqCurrentMa must have an absolute value of at least 10 mA"
+        }
+        [byte[]]$iqPayload = [BitConverter]::GetBytes([int]$IqCurrentMa)
+        [int]$idMa = 0
+        [int]$iqMa = 0
+        $iqSampleCount = [Math]::Max(1, [int]($IqDurationMs / 100))
+        [long]$idSumMa = 0
+        [long]$iqSumMa = 0
+        for ($sampleIndex = 0; $sampleIndex -lt $iqSampleCount; ++$sampleIndex) {
+            [void](Assert-CescResponse (Send-CescRequest $port 5 9 $nextSequence $iqPayload) 5 9 $nextSequence)
+            ++$nextSequence
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            if ($powerAfter.Length -lt 322) {
+                throw "Power-stage response lacks current-control diagnostics"
+            }
+            $stateNow = [int]$powerAfter[0]
+            $flagsNow = [int]$powerAfter[1]
+            $faultsNow = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+            $controlMode = [int]$powerAfter[305]
+            $idMa = [BitConverter]::ToInt32([byte[]]$powerAfter[306..309], 0)
+            $iqMa = [BitConverter]::ToInt32([byte[]]$powerAfter[310..313], 0)
+            $iqTargetMa = [BitConverter]::ToInt32([byte[]]$powerAfter[314..317], 0)
+            $timeoutRemainingMs = [BitConverter]::ToUInt32([byte[]]$powerAfter[318..321], 0)
+            $idSumMa += $idMa
+            $iqSumMa += $iqMa
+            if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
+                $faultsNow -ne 0 -or $controlMode -ne 1 -or
+                $iqTargetMa -ne $IqCurrentMa -or $timeoutRemainingMs -eq 0) {
+                throw "Iq control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode Id=$idMa Iq=$iqMa target=$iqTargetMa timeout=$timeoutRemainingMs"
+            }
+            Write-Output "Iq control sample=$sampleIndex Id=${idMa}mA Iq=${iqMa}mA target=${iqTargetMa}mA timeout=${timeoutRemainingMs}ms"
+        }
+        $transformSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[110..113], 0)
+        $idTransformSumMa = [BitConverter]::ToInt64([byte[]]$powerAfter[114..121], 0)
+        $iqTransformSumMa = [BitConverter]::ToInt64([byte[]]$powerAfter[122..129], 0)
+        $idMinMa = [BitConverter]::ToInt32([byte[]]$powerAfter[130..133], 0)
+        $idMaxMa = [BitConverter]::ToInt32([byte[]]$powerAfter[134..137], 0)
+        $iqMinMa = [BitConverter]::ToInt32([byte[]]$powerAfter[138..141], 0)
+        $iqMaxMa = [BitConverter]::ToInt32([byte[]]$powerAfter[142..145], 0)
+        $voltageSaturatedSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[162..165], 0)
+        $voltageRequestSumCounts = [BitConverter]::ToUInt64([byte[]]$powerAfter[174..181], 0)
+        $voltageRequestMaxCounts = [BitConverter]::ToUInt16([byte[]]$powerAfter[182..183], 0)
+        $idTransformAverageMa = if ($transformSamples -gt 0) { [Math]::Round($idTransformSumMa / [double]$transformSamples, 1) } else { 0.0 }
+        $iqTransformAverageMa = if ($transformSamples -gt 0) { [Math]::Round($iqTransformSumMa / [double]$transformSamples, 1) } else { 0.0 }
+        $voltageRequestAverageCounts = if ($transformSamples -gt 0) { [Math]::Round($voltageRequestSumCounts / [double]$transformSamples, 1) } else { 0.0 }
+        Write-Output "Iq aggregate transforms=$transformSamples IdAvg=${idTransformAverageMa}mA IqAvg=${iqTransformAverageMa}mA IdRange=$idMinMa..$idMaxMa IqRange=$iqMinMa..$iqMaxMa voltageRequestAvg=$voltageRequestAverageCounts max=$voltageRequestMaxCounts saturated=$voltageSaturatedSamples"
+        if ($VerifyIqWatchdog) {
+            Start-Sleep -Milliseconds 700
+        } else {
+            [void](Assert-CescResponse (Send-CescRequest $port 5 2 $nextSequence ([byte[]]@())) 5 2 $nextSequence)
+            ++$nextSequence
+            Start-Sleep -Milliseconds 100
+        }
+        $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+        ++$nextSequence
+        $sampleAfter = Invoke-CescRequestWithRetry $port 2 1 $nextSequence ([byte[]]@(0))
+        ++$nextSequence
+        $stateAfter = [int]$powerAfter[0]
+        $flagsAfter = [int]$powerAfter[1]
+        $controlModeAfter = [int]$powerAfter[305]
+        if ($stateAfter -ne 2 -or ($flagsAfter -band 0x03) -ne 0 -or
+            $controlModeAfter -ne 0) {
+            $releaseKind = if ($VerifyIqWatchdog) { "watchdog" } else { "STOP" }
+            throw "$releaseKind did not release Iq control state=$stateAfter flags=$flagsAfter mode=$controlModeAfter"
+        }
+        $positionAfterDegrees = [BitConverter]::ToSingle([byte[]]$sampleAfter[22..25], 0)
+        $positionDeltaDegrees = [Math]::Round($positionAfterDegrees - $positionDegrees, 3)
+        $idAverageMa = [Math]::Round($idSumMa / [double]$iqSampleCount, 1)
+        $iqAverageMa = [Math]::Round($iqSumMa / [double]$iqSampleCount, 1)
+        $releaseKind = if ($VerifyIqWatchdog) { "watchdog" } else { "stop" }
+        $motorResult = "iq-current targetMa=$IqCurrentMa durationMs=$IqDurationMs polledIdAverageMa=$idAverageMa polledIqAverageMa=$iqAverageMa transformIdAverageMa=$idTransformAverageMa transformIqAverageMa=$iqTransformAverageMa iqRangeMa=$iqMinMa..$iqMaxMa voltageRequestCountsAvg=$voltageRequestAverageCounts voltageRequestCountsMax=$voltageRequestMaxCounts positionDeltaDegrees=$positionDeltaDegrees ${releaseKind}Verified=true"
+    }
+    if ($RunTorqueTest) {
+        if ([Math]::Abs($TorqueTargetMnm) -lt 3) {
+            throw "TorqueTargetMnm must have an absolute value of at least 3 mN*m"
+        }
+        [byte[]]$torquePayload = [BitConverter]::GetBytes([int]$TorqueTargetMnm)
+        [int]$expectedIqMa = [Math]::Round($TorqueTargetMnm * 1000.0 / 230.0)
+        for ($sampleIndex = 0; $sampleIndex -lt 8; ++$sampleIndex) {
+            [void](Assert-CescResponse (Send-CescRequest $port 5 14 $nextSequence $torquePayload) 5 14 $nextSequence)
+            ++$nextSequence
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            $stateNow = [int]$powerAfter[0]
+            $flagsNow = [int]$powerAfter[1]
+            $faultsNow = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+            $controlMode = [int]$powerAfter[305]
+            $torqueIqTargetMa = [BitConverter]::ToInt32([byte[]]$powerAfter[314..317], 0)
+            if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
+                $faultsNow -ne 0 -or $controlMode -ne 1 -or
+                [Math]::Abs($torqueIqTargetMa - $expectedIqMa) -gt 1) {
+                throw "Torque control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode expectedIq=$expectedIqMa iqTarget=$torqueIqTargetMa"
+            }
+            Write-Output "Torque sample=$sampleIndex target=${TorqueTargetMnm}mNm estimatedIq=${torqueIqTargetMa}mA"
+        }
+        [void](Assert-CescResponse (Send-CescRequest $port 5 2 $nextSequence ([byte[]]@())) 5 2 $nextSequence)
+        ++$nextSequence
+        Start-Sleep -Milliseconds 100
+        $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+        ++$nextSequence
+        if ([int]$powerAfter[0] -ne 2 -or ([int]$powerAfter[1] -band 0x03) -ne 0 -or
+            [int]$powerAfter[305] -ne 0) { throw "STOP did not release torque control" }
+        $motorResult = "torque targetMnm=$TorqueTargetMnm estimatedIqTargetMa=$expectedIqMa KtNmPerA=0.23 stopVerified=true"
+    }
+    if ($RunSpeedTest) {
+        if ([Math]::Abs($SpeedTargetMdps) -lt 50) {
+            throw "SpeedTargetMdps must have an absolute value of at least 50"
+        }
+        [byte[]]$speedPayload = [BitConverter]::GetBytes([int]$SpeedTargetMdps)
+        [double]$speedPositionStart = $positionDegrees
+        [long]$actualSpeedSumMdps = 0
+        [int]$speedSamples = $SpeedSamples
+        for ($sampleIndex = 0; $sampleIndex -lt $speedSamples; ++$sampleIndex) {
+            [void](Assert-CescResponse (Send-CescRequest $port 5 10 $nextSequence $speedPayload) 5 10 $nextSequence)
+            ++$nextSequence
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            if ($powerAfter.Length -lt 330) { throw "Power-stage response lacks speed diagnostics" }
+            $stateNow = [int]$powerAfter[0]
+            $flagsNow = [int]$powerAfter[1]
+            $faultsNow = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+            $controlMode = [int]$powerAfter[305]
+            $iqTargetMa = [BitConverter]::ToInt32([byte[]]$powerAfter[314..317], 0)
+            $speedTargetNow = [BitConverter]::ToInt32([byte[]]$powerAfter[322..325], 0)
+            $speedActualNow = [BitConverter]::ToInt32([byte[]]$powerAfter[326..329], 0)
+            $actualSpeedSumMdps += $speedActualNow
+            if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
+                $faultsNow -ne 0 -or $controlMode -ne 2 -or
+                $speedTargetNow -ne $SpeedTargetMdps -or
+                [Math]::Abs($iqTargetMa) -gt 300) {
+                throw "Speed control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode target=$speedTargetNow actual=$speedActualNow iqTarget=$iqTargetMa"
+            }
+            Write-Output "Speed sample=$sampleIndex target=${speedTargetNow}mdps actual=${speedActualNow}mdps iqTarget=${iqTargetMa}mA"
+        }
+        $speedTransformSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[110..113], 0)
+        $speedIdSumMa = [BitConverter]::ToInt64([byte[]]$powerAfter[114..121], 0)
+        $speedIqSumMa = [BitConverter]::ToInt64([byte[]]$powerAfter[122..129], 0)
+        $speedIqTargetSumMa = [BitConverter]::ToInt64([byte[]]$powerAfter[146..153], 0)
+        $speedVoltageSaturated = [BitConverter]::ToUInt32([byte[]]$powerAfter[162..165], 0)
+        $speedIdAverageMa = if ($speedTransformSamples -gt 0) { [Math]::Round($speedIdSumMa / [double]$speedTransformSamples, 1) } else { 0.0 }
+        $speedIqAverageMa = if ($speedTransformSamples -gt 0) { [Math]::Round($speedIqSumMa / [double]$speedTransformSamples, 1) } else { 0.0 }
+        $speedIqTargetAverageMa = if ($speedTransformSamples -gt 0) { [Math]::Round($speedIqTargetSumMa / [double]$speedTransformSamples, 1) } else { 0.0 }
+        Write-Output "Speed aggregate transforms=$speedTransformSamples IdAvg=${speedIdAverageMa}mA IqAvg=${speedIqAverageMa}mA IqTargetAvg=${speedIqTargetAverageMa}mA voltageSaturated=$speedVoltageSaturated"
+        [void](Assert-CescResponse (Send-CescRequest $port 5 2 $nextSequence ([byte[]]@())) 5 2 $nextSequence)
+        ++$nextSequence
+        Start-Sleep -Milliseconds 100
+        $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+        ++$nextSequence
+        $sampleAfter = Invoke-CescRequestWithRetry $port 2 1 $nextSequence ([byte[]]@(0))
+        ++$nextSequence
+        if ([int]$powerAfter[0] -ne 2 -or ([int]$powerAfter[1] -band 0x03) -ne 0 -or
+            [int]$powerAfter[305] -ne 0) {
+            throw "STOP did not release speed control"
+        }
+        $speedPositionAfter = [BitConverter]::ToSingle([byte[]]$sampleAfter[22..25], 0)
+        $speedPositionDelta = [Math]::Round($speedPositionAfter - $speedPositionStart, 3)
+        $speedAverageMdps = [Math]::Round($actualSpeedSumMdps / [double]$speedSamples, 1)
+        $motorResult = "speed targetMdps=$SpeedTargetMdps actualAverageMdps=$speedAverageMdps idAverageMa=$speedIdAverageMa iqAverageMa=$speedIqAverageMa iqTargetAverageMa=$speedIqTargetAverageMa positionDeltaDegrees=$speedPositionDelta stopVerified=true"
+    }
+    if ($RunPositionTest) {
+        if ([Math]::Abs($RelativePositionTargetMdeg) -lt 500) {
+            throw "RelativePositionTargetMdeg must have an absolute value of at least 500"
+        }
+        [int]$positionStartMdeg = [Math]::Round($positionDegrees * 1000.0)
+        [int]$positionTargetMdeg = $positionStartMdeg + $RelativePositionTargetMdeg
+        [byte[]]$positionPayload = [BitConverter]::GetBytes($positionTargetMdeg)
+        [int]$positionFeedbackMdeg = $positionStartMdeg
+        [int]$positionSpeedMdps = 0
+        [int]$positionIqTargetMa = 0
+        for ($sampleIndex = 0; $sampleIndex -lt 30; ++$sampleIndex) {
+            [void](Assert-CescResponse (Send-CescRequest $port 5 11 $nextSequence $positionPayload) 5 11 $nextSequence)
+            ++$nextSequence
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            if ($powerAfter.Length -lt 338) { throw "Power-stage response lacks position diagnostics" }
+            $stateNow = [int]$powerAfter[0]
+            $flagsNow = [int]$powerAfter[1]
+            $faultsNow = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+            $controlMode = [int]$powerAfter[305]
+            $positionIqTargetMa = [BitConverter]::ToInt32([byte[]]$powerAfter[314..317], 0)
+            $positionSpeedMdps = [BitConverter]::ToInt32([byte[]]$powerAfter[326..329], 0)
+            $targetNow = [BitConverter]::ToInt32([byte[]]$powerAfter[330..333], 0)
+            $positionFeedbackMdeg = [BitConverter]::ToInt32([byte[]]$powerAfter[334..337], 0)
+            if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
+                $faultsNow -ne 0 -or $controlMode -ne 3 -or
+                $targetNow -ne $positionTargetMdeg -or
+                [Math]::Abs($positionIqTargetMa) -gt 300) {
+                throw "Position control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode target=$targetNow actual=$positionFeedbackMdeg speed=$positionSpeedMdps iqTarget=$positionIqTargetMa"
+            }
+            Write-Output "Position sample=$sampleIndex target=${targetNow}mdeg actual=${positionFeedbackMdeg}mdeg speed=${positionSpeedMdps}mdps iqTarget=${positionIqTargetMa}mA"
+        }
+        [void](Assert-CescResponse (Send-CescRequest $port 5 2 $nextSequence ([byte[]]@())) 5 2 $nextSequence)
+        ++$nextSequence
+        Start-Sleep -Milliseconds 100
+        $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+        ++$nextSequence
+        if ([int]$powerAfter[0] -ne 2 -or ([int]$powerAfter[1] -band 0x03) -ne 0 -or
+            [int]$powerAfter[305] -ne 0) { throw "STOP did not release position control" }
+        $positionErrorMdeg = $positionTargetMdeg - $positionFeedbackMdeg
+        if ([Math]::Abs($positionErrorMdeg) -gt 1000) {
+            throw "Position target not reached target=$positionTargetMdeg actual=$positionFeedbackMdeg error=$positionErrorMdeg"
+        }
+        $motorResult = "position relativeTargetMdeg=$RelativePositionTargetMdeg finalErrorMdeg=$positionErrorMdeg finalSpeedMdps=$positionSpeedMdps finalIqTargetMa=$positionIqTargetMa stopVerified=true"
+    }
+    if ($RunPositionProfileTest) {
+        if ([Math]::Abs($RelativePositionTargetMdeg) -lt 500) {
+            throw "RelativePositionTargetMdeg must have an absolute value of at least 500"
+        }
+        [int]$profileStartMdeg = [Math]::Round($positionDegrees * 1000.0)
+        [int]$profileTargetMdeg = $profileStartMdeg + $RelativePositionTargetMdeg
+        if ($profileTargetMdeg -lt -3600000 -or $profileTargetMdeg -gt 3600000) {
+            throw "Absolute profile target is outside the firmware +/-10 turn range"
+        }
+        [byte[]]$profilePayload = [BitConverter]::GetBytes($profileTargetMdeg) +
+            [BitConverter]::GetBytes([int]$PositionProfileSpeedMdps) +
+            [BitConverter]::GetBytes([int]$PositionProfileAccelerationMdps2) +
+            [BitConverter]::GetBytes([int]$PositionProfileDecelerationMdps2)
+        [int]$profileFeedbackMdeg = $profileStartMdeg
+        [int]$profileActualSpeedMdps = 0
+        [int]$profileIqTargetMa = 0
+        [int]$profileDurationMs = [Math]::Min(30000,
+            [Math]::Max(2000, [int](1000.0 * [Math]::Abs($RelativePositionTargetMdeg) /
+                $PositionProfileSpeedMdps) + 2000))
+        [int]$profileSamples = [int][Math]::Ceiling($profileDurationMs / 100.0)
+        for ($sampleIndex = 0; $sampleIndex -lt $profileSamples; ++$sampleIndex) {
+            [void](Assert-CescResponse (Send-CescRequest $port 5 12 $nextSequence $profilePayload) 5 12 $nextSequence)
+            ++$nextSequence
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            if ($powerAfter.Length -lt 338) { throw "Power-stage response lacks profile diagnostics" }
+            $stateNow = [int]$powerAfter[0]
+            $flagsNow = [int]$powerAfter[1]
+            $faultsNow = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+            $controlMode = [int]$powerAfter[305]
+            $profileIqTargetMa = [BitConverter]::ToInt32([byte[]]$powerAfter[314..317], 0)
+            $profileActualSpeedMdps = [BitConverter]::ToInt32([byte[]]$powerAfter[326..329], 0)
+            $targetNow = [BitConverter]::ToInt32([byte[]]$powerAfter[330..333], 0)
+            $profileFeedbackMdeg = [BitConverter]::ToInt32([byte[]]$powerAfter[334..337], 0)
+            if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
+                $faultsNow -ne 0 -or $controlMode -ne 4 -or
+                $targetNow -ne $profileTargetMdeg -or
+                [Math]::Abs($profileIqTargetMa) -gt 300) {
+                throw "Position profile invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode target=$targetNow actual=$profileFeedbackMdeg speed=$profileActualSpeedMdps iqTarget=$profileIqTargetMa"
+            }
+            Write-Output "Profile sample=$sampleIndex target=${targetNow}mdeg actual=${profileFeedbackMdeg}mdeg speed=${profileActualSpeedMdps}mdps iqTarget=${profileIqTargetMa}mA"
+        }
+        [void](Assert-CescResponse (Send-CescRequest $port 5 2 $nextSequence ([byte[]]@())) 5 2 $nextSequence)
+        ++$nextSequence
+        Start-Sleep -Milliseconds 100
+        $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+        ++$nextSequence
+        if ([int]$powerAfter[0] -ne 2 -or ([int]$powerAfter[1] -band 0x03) -ne 0 -or
+            [int]$powerAfter[305] -ne 0) { throw "STOP did not release position profile" }
+        $profileErrorMdeg = $profileTargetMdeg - $profileFeedbackMdeg
+        if ([Math]::Abs($profileErrorMdeg) -gt 1500) {
+            throw "Position profile target not reached target=$profileTargetMdeg actual=$profileFeedbackMdeg error=$profileErrorMdeg"
+        }
+        $motorResult = "position-profile relativeTargetMdeg=$RelativePositionTargetMdeg maximumSpeedMdps=$PositionProfileSpeedMdps accelerationMdps2=$PositionProfileAccelerationMdps2 decelerationMdps2=$PositionProfileDecelerationMdps2 finalErrorMdeg=$profileErrorMdeg finalSpeedMdps=$profileActualSpeedMdps finalIqTargetMa=$profileIqTargetMa stopVerified=true"
+    }
+    if ($RunHapticTest) {
+        [int]$hapticCenterMdeg = [Math]::Round($positionDegrees * 1000.0)
+        [int]$hapticMinimumMdeg = [Math]::Max(-3600000, $hapticCenterMdeg - 180000)
+        [int]$hapticMaximumMdeg = [Math]::Min(3600000, $hapticCenterMdeg + 180000)
+        [byte[]]$hapticPayload = [BitConverter]::GetBytes([int]$HapticDetentSpacingMdeg) +
+            [BitConverter]::GetBytes([int]$HapticDetentStrengthMa) +
+            [BitConverter]::GetBytes([int]$HapticDampingMaPerDps) +
+            [BitConverter]::GetBytes($hapticMinimumMdeg) +
+            [BitConverter]::GetBytes($hapticMaximumMdeg)
+        for ($sampleIndex = 0; $sampleIndex -lt 30; ++$sampleIndex) {
+            [void](Assert-CescResponse (Send-CescRequest $port 5 13 $nextSequence $hapticPayload) 5 13 $nextSequence)
+            ++$nextSequence
+            Start-Sleep -Milliseconds 100
+            $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            $stateNow = [int]$powerAfter[0]
+            $flagsNow = [int]$powerAfter[1]
+            $faultsNow = [int]$powerAfter[2] -bor ([int]$powerAfter[3] -shl 8)
+            $controlMode = [int]$powerAfter[305]
+            $hapticIqTargetMa = [BitConverter]::ToInt32([byte[]]$powerAfter[314..317], 0)
+            $hapticSpeedMdps = [BitConverter]::ToInt32([byte[]]$powerAfter[326..329], 0)
+            $hapticPositionMdeg = [BitConverter]::ToInt32([byte[]]$powerAfter[334..337], 0)
+            if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
+                $faultsNow -ne 0 -or $controlMode -ne 5 -or
+                [Math]::Abs($hapticIqTargetMa) -gt 300) {
+                throw "Haptic control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode position=$hapticPositionMdeg speed=$hapticSpeedMdps iqTarget=$hapticIqTargetMa"
+            }
+            Write-Output "Haptic sample=$sampleIndex position=${hapticPositionMdeg}mdeg speed=${hapticSpeedMdps}mdps iqTarget=${hapticIqTargetMa}mA"
+        }
+        [void](Assert-CescResponse (Send-CescRequest $port 5 2 $nextSequence ([byte[]]@())) 5 2 $nextSequence)
+        ++$nextSequence
+        Start-Sleep -Milliseconds 100
+        $powerAfter = Invoke-CescRequestWithRetry $port 5 0 $nextSequence ([byte[]]@())
+        ++$nextSequence
+        if ([int]$powerAfter[0] -ne 2 -or ([int]$powerAfter[1] -band 0x03) -ne 0 -or
+            [int]$powerAfter[305] -ne 0) { throw "STOP did not release haptic control" }
+        $motorResult = "haptic spacingMdeg=$HapticDetentSpacingMdeg strengthMa=$HapticDetentStrengthMa dampingMaPerDps=$HapticDampingMaPerDps limitsMdeg=$hapticMinimumMdeg..$hapticMaximumMdeg stopVerified=true"
     }
     if ($RunResistanceTest -or $RunInductanceTest -or $RunFluxTest) {
         [void](Assert-CescResponse (Send-CescRequest $port 5 6 $nextSequence ([byte[]]@())) 5 6 $nextSequence)
@@ -190,11 +532,11 @@ try {
         $testState = [int]$powerAfter[38]
         if ($stateAfter -ne 2 -or ($flagsAfter -band 0x03) -ne 0 -or
             $faultsAfter -ne 0 -or $testState -ne 2 -or
-            $valid -ne 1 -or $forwardSamples -lt 1000 -or $reverseSamples -lt 1000 -or
-            $forwardMilliohms -le 0 -or $reverseMilliohms -le 0 -or $averageMilliohms -le 0) {
+            $valid -ne 1 -or $forwardSamples -lt 1000 -or $reverseSamples -ne 0 -or
+            $forwardMilliohms -le 0 -or $reverseMilliohms -ne 0 -or $averageMilliohms -le 0) {
             throw "Resistance measurement failed state=$stateAfter flags=$flagsAfter faults=$faultsAfter testState=$testState valid=$valid samples=$forwardSamples/$reverseSamples resistanceMilliohms=$forwardMilliohms/$reverseMilliohms/$averageMilliohms"
         }
-        $motorResult = "resistance samples=$forwardSamples/$reverseSamples forwardOhm=$($forwardMilliohms / 1000.0) reverseOhm=$($reverseMilliohms / 1000.0) phaseResistanceOhm=$($averageMilliohms / 1000.0)"
+        $motorResult = "resistance samples=$forwardSamples vescLockedOhm=$($forwardMilliohms / 1000.0) phaseResistanceOhm=$($averageMilliohms / 1000.0)"
     }
     if ($RunInductanceTest) {
         [void](Assert-CescResponse (Send-CescRequest $port 5 7 $nextSequence ([byte[]]@())) 5 7 $nextSequence)
@@ -389,10 +731,10 @@ try {
     if ($RunEncoderAlignment) {
         [void](Assert-CescResponse (Send-CescRequest $port 5 3 $nextSequence ([byte[]]@())) 5 3 $nextSequence)
         ++$nextSequence
-        Start-Sleep -Milliseconds 2750
+        Start-Sleep -Milliseconds 9300
         $sampleHeld = Assert-CescResponse (Send-CescRequest $port 2 1 $nextSequence ([byte[]]@(0))) 2 1 $nextSequence
         ++$nextSequence
-        Start-Sleep -Milliseconds 450
+        Start-Sleep -Milliseconds 300
         $powerAfter = Assert-CescResponse (Send-CescRequest $port 5 0 $nextSequence ([byte[]]@())) 5 0 $nextSequence
         ++$nextSequence
         $sampleAfter = Assert-CescResponse (Send-CescRequest $port 2 1 $nextSequence ([byte[]]@(0))) 2 1 $nextSequence
@@ -418,13 +760,7 @@ try {
             ($calibratedFlags -band 1) -eq 0 -or ($heldFlags -band 1) -eq 0) {
             throw "Encoder alignment unsafe/incomplete state=$stateAfter flags=$flagsAfter faults=$faultsAfter testState=$testState angleFlags=$calibratedFlags heldFlags=$heldFlags"
         }
-        [int]$targetError = $heldAlignedRaw - 1024
-        while ($targetError -gt 2048) { $targetError -= 4096 }
-        while ($targetError -lt -2048) { $targetError += 4096 }
-        if ([Math]::Abs($targetError) -gt 64) {
-            throw "Held electrical angle is not near 90 degrees: raw=$heldAlignedRaw degrees=$heldAlignedDegrees error=$targetError zero=$zeroAfter"
-        }
-        $motorResult = "encoder-vector-validation targetRaw=1024 zeroRaw=$zeroAfter heldRaw=$heldAlignedRaw heldDegrees=$heldAlignedDegrees targetError=$targetError heldMechanicalAngle=$heldMechanicalAngle releasedRaw=$alignedAfter releasedDegrees=$alignedDegreesAfter mechanicalDelta=$alignmentMechanicalDelta"
+        $motorResult = "encoder-vesc-bidirectional-sweep zeroRaw=$zeroAfter finalRaw=$alignedAfter finalDegrees=$alignedDegreesAfter mechanicalDelta=$alignmentMechanicalDelta"
     }
     if ($RunCommissioningTest) {
         [byte]$directionByte = if ($CommissioningDirection -gt 0) { 1 } else { 255 }

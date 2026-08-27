@@ -7,6 +7,7 @@
 #include "cmsis_os2.h"
 #include "firmware_update.h"
 #include "main.h"
+#include "motor_control_config.h"
 #include "power_stage.h"
 #include "usb_cdc_transport.h"
 #include "cesc_crc.h"
@@ -54,6 +55,12 @@ enum {
     MOTOR_MEASURE_RESISTANCE = 0x06,
     MOTOR_MEASURE_INDUCTANCE = 0x07,
     MOTOR_MEASURE_FLUX = 0x08,
+    MOTOR_SET_IQ_CURRENT = 0x09,
+    MOTOR_SET_SPEED = 0x0A,
+    MOTOR_SET_POSITION = 0x0B,
+    MOTOR_SET_POSITION_PROFILE = 0x0C,
+    MOTOR_SET_HAPTIC = 0x0D,
+    MOTOR_SET_TORQUE = 0x0E,
     TELEMETRY_ENUM_CHANNELS = 0x00,
     TELEMETRY_SUBSCRIBE = 0x01,
     TELEMETRY_UNSUBSCRIBE = 0x02,
@@ -731,6 +738,15 @@ static void motor_service(uint8_t command, uint16_t sequence,
         write_u32(&response_buffer[index], diagnostics.flux_linkage_uwb); index += 4U;
         write_u32(&response_buffer[index], diagnostics.back_emf_constant_uv_per_rad_s); index += 4U;
         write_u32(&response_buffer[index], diagnostics.kv_millirpm_per_volt); index += 4U;
+        response_buffer[index++] = (uint8_t)diagnostics.control_mode;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_id_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_iq_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_iq_target_ma); index += 4U;
+        write_u32(&response_buffer[index], diagnostics.control_timeout_remaining_ms); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_speed_target_millidegrees_per_second); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_speed_millidegrees_per_second); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_position_target_millidegrees); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_position_millidegrees); index += 4U;
         send_response(SERVICE_MOTOR, command, sequence, STATUS_OK,
                       (uint16_t)(index - 2U));
         return;
@@ -792,6 +808,96 @@ static void motor_service(uint8_t command, uint16_t sequence,
         if (!power_stage_start_flux_measurement((int8_t)payload[0])) {
             send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
             return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_SET_IQ_CURRENT:
+        if (length != 4U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        {
+        const int32_t iq_target_ma = (int32_t)read_u32(payload);
+        if ((iq_target_ma < -motor_control_config.maximum_iq_ma) ||
+            (iq_target_ma > motor_control_config.maximum_iq_ma)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_OUT_OF_RANGE, 0U);
+            return;
+        }
+        if (!power_stage_set_iq_current_ma(iq_target_ma)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_SET_SPEED:
+        if (length != 4U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        {
+        const int32_t speed_target = (int32_t)read_u32(payload);
+        if ((speed_target < -motor_control_config.maximum_speed_mdps) ||
+            (speed_target > motor_control_config.maximum_speed_mdps)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_OUT_OF_RANGE, 0U);
+            return;
+        }
+        if (!power_stage_set_speed_millidegrees_per_second(speed_target)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_SET_POSITION:
+        if (length != 4U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        {
+        const int32_t position_target = (int32_t)read_u32(payload);
+        if ((position_target < -motor_control_config.maximum_position_mdeg) ||
+            (position_target > motor_control_config.maximum_position_mdeg)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_OUT_OF_RANGE, 0U);
+            return;
+        }
+        if (!power_stage_set_position_millidegrees(position_target)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_SET_POSITION_PROFILE:
+        if ((length != 8U) && (length != 16U)) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_set_position_profile((int32_t)read_u32(payload),
+                                              (int32_t)read_u32(&payload[4]),
+                                              length == 16U ? (int32_t)read_u32(&payload[8]) : 0,
+                                              length == 16U ? (int32_t)read_u32(&payload[12]) : 0)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_SET_HAPTIC:
+        if (length != 20U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_set_haptic((int32_t)read_u32(payload),
+                                    (int32_t)read_u32(&payload[4]),
+                                    (int32_t)read_u32(&payload[8]),
+                                    (int32_t)read_u32(&payload[12]),
+                                    (int32_t)read_u32(&payload[16]))) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
+        return;
+    case MOTOR_SET_TORQUE:
+        if (length != 4U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        {
+        const int32_t torque_target_mnm = (int32_t)read_u32(payload);
+        const int32_t maximum_torque_mnm = (int32_t)(
+            (float)motor_control_config.maximum_iq_ma *
+            motor_control_config.torque_constant_nm_per_amp);
+        if (torque_target_mnm < -maximum_torque_mnm ||
+            torque_target_mnm > maximum_torque_mnm) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_OUT_OF_RANGE, 0U);
+            return;
+        }
+        if (!power_stage_set_torque_millinewton_metres(torque_target_mnm)) {
+            send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U);
+            return;
+        }
         }
         send_response(SERVICE_MOTOR, command, sequence, STATUS_OK, 0U);
         return;

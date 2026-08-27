@@ -12,6 +12,15 @@ typedef enum {
   POWER_STAGE_FAULT
 } power_stage_state_t;
 
+typedef enum {
+  POWER_STAGE_CONTROL_DISABLED = 0,
+  POWER_STAGE_CONTROL_IQ_CURRENT,
+  POWER_STAGE_CONTROL_SPEED,
+  POWER_STAGE_CONTROL_POSITION,
+  POWER_STAGE_CONTROL_POSITION_PROFILE,
+  POWER_STAGE_CONTROL_HAPTIC
+} power_stage_control_mode_t;
+
 typedef struct {
   uint16_t raw[3];
   int32_t centered[3];
@@ -85,6 +94,15 @@ typedef struct {
   uint32_t flux_linkage_uwb;
   uint32_t back_emf_constant_uv_per_rad_s;
   uint32_t kv_millirpm_per_volt;
+  power_stage_control_mode_t control_mode;
+  int32_t control_id_ma;
+  int32_t control_iq_ma;
+  int32_t control_iq_target_ma;
+  uint32_t control_timeout_remaining_ms;
+  int32_t control_speed_target_millidegrees_per_second;
+  int32_t control_speed_millidegrees_per_second;
+  int32_t control_position_target_millidegrees;
+  int32_t control_position_millidegrees;
 } power_stage_diagnostics_t;
 
 typedef enum {
@@ -125,6 +143,25 @@ bool power_stage_start_current_foc_test(int8_t direction);
 bool power_stage_start_resistance_measurement(void);
 bool power_stage_start_inductance_measurement(void);
 bool power_stage_start_flux_measurement(int8_t direction);
+/**
+ * Enter or refresh sensored FOC current control. The command must be refreshed
+ * before the internal command watchdog expires. A zero target releases the
+ * bridge, matching VESC current-mode semantics.
+ */
+bool power_stage_set_iq_current_ma(int32_t iq_target_ma);
+/** Set estimated shaft torque in mN*m using motor_control_config.Kt. */
+bool power_stage_set_torque_millinewton_metres(int32_t torque_target_mnm);
+bool power_stage_set_speed_millidegrees_per_second(int32_t speed_target);
+bool power_stage_set_position_millidegrees(int32_t position_target);
+bool power_stage_set_position_profile(int32_t position_target,
+                                      int32_t maximum_speed_mdps,
+                                      int32_t acceleration_mdps2,
+                                      int32_t deceleration_mdps2);
+bool power_stage_set_haptic(int32_t detent_spacing_mdeg,
+                            int32_t detent_strength_ma,
+                            int32_t damping_ma_per_dps,
+                            int32_t minimum_position_mdeg,
+                            int32_t maximum_position_mdeg);
 void power_stage_stop_commissioning_test(void);
 power_stage_test_state_t power_stage_get_test_state(void);
 uint8_t power_stage_get_test_steps_completed(void);

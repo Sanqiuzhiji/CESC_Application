@@ -618,21 +618,21 @@ Rs_reverse = average(Vd_reverse) / average(Id_reverse)
 Rs          = (Rs_forward + Rs_reverse) / 2
 ```
 
-相电阻辨识单独允许最大50%电压矢量，以在6 V母线下为5.4 Ω相电阻和0.5 A测试电流提供调节余量；该限制不改变其他commissioning与FOC控制路径的调制度上限。ADC软件过流、DRV8301 nFAULT和母线电压限制始终有效。
+相电阻辨识单独允许最大50%电压矢量。辨识电流暂定为0.4 A；更高电流在当前ADC/PWM采样结构下表现出调制度相关偏差，并接近20-count软件保护的瞬态边界。与参考VESC提交db6ba047一致，只执行一次正向锁定电流测量；所得电压电流比乘以2/3，输出星形等效FOC相电阻。兼容字段reverseSamples和reverseMilliohms返回0。该限制不改变其他commissioning与FOC控制路径的调制度上限；ADC软件过流、DRV8301 nFAULT和母线电压限制始终有效。
 
 ### Phase Inductance 与 Flux Linkage 辨识扩展
 
-`MOTOR_MEASURE_INDUCTANCE (0x07)` 无请求载荷，要求当前会话已经完成且保留有效的相电阻结果。辨识在固定 d 轴施加正负双极性方波，等待周期稳态后分别累计 250 个端点平均值，再用精确 RL 方波响应计算相电感。正负方向结果用于诊断，最终值由差分电压和差分电流计算，以抵消 ADC 偏置与逆变器方向压降。
+`MOTOR_MEASURE_INDUCTANCE (0x07)` 无请求载荷，要求当前会话已经完成且保留有效的相电阻结果。实现移植自参考VESC提交db6ba047：TIM1临时切换到3 kHz测量时基，从2% duty开始按1.5倍递增，直至三相短脉冲平均电流达到约0.5 A；随后依次对三组相线施加200轮短脉冲，在脉冲末端同步采样对应相电流。使用 `L=V*t/I`、50 timer-count上升时间补偿及2/3 FOC相参数归一化。完成、超时或故障后恢复20 kHz控制时基。兼容字段forward保存VESC三相平均结果，reverse字段返回0。
 
-`MOTOR_MEASURE_FLUX (0x08)` 请求载荷为一个 `int8` 方向（`+1` 或 `-1`），同样要求有效 Rs。模块使用 AS5600 实际机械位置产生受限的 60 rpm 旋转电压矢量，仅接收 300–420 degree/s、方向一致且传感器新鲜的稳态样本。三路 AD8418 使用 inline full-Clarke 电流变换。稳态 PMSM 关系为：
+`MOTOR_MEASURE_FLUX (0x08)` 请求载荷为一个 `int8` 方向（`+1` 或 `-1`），同样要求有效 Rs。模块使用 AS5600 实际机械位置产生受限的 60 rpm 旋转电压矢量，仅接收 300–420 degree/s、方向一致且传感器新鲜的稳态样本。三路 AD8418 使用 inline full-Clarke 电流变换。原始调制矢量电压按参考VESC的FOC相电压约定乘以2/3，稳态 PMSM 关系为：
 
-`lambda = (Vq - Rs * Iq) / omega_e`
+`lambda = (2/3) * (Vq - Rs * Iq) / omega_e`
 
 `Ke_mechanical = pole_pairs * lambda`
 
 `KV = 60 / (2*pi*pole_pairs*lambda)`
 
-建议依次执行 Rs、L，再对 `0x08` 执行正转和反转，将两次 `lambda` 平均后重新计算 Ke/KV。台架实测（8.05 V、11 极对）正转 `0.015510 Wb`、反转 `0.017272 Wb`，平均 `0.016391 Wb`，对应 `Ke=0.1803 V/(rad/s)`、`KV=52.96 rpm/V`；铭牌 KV 为 54 rpm/V。
+建议依次执行 Rs、L，再对 `0x08` 执行正转和反转，将两次 `lambda` 平均后重新计算。协议中的 Ke/KV 是由该FOC相磁链派生的内部量，不等同于铭牌常见的线间RMS定义。
 
 功率级状态响应在相电感字段（偏移 246–275）之后追加：
 
@@ -646,6 +646,80 @@ Rs          = (Rs_forward + Rs_reverse) / 2
 | 293 | uint32 | flux_linkage_uWb |
 | 297 | uint32 | mechanical_Ke_uV_per_rad_s |
 | 301 | uint32 | KV_milliRPM_per_V |
+
+正式电流控制字段追加在偏移 305：
+
+| 偏移 | 类型 | 字段 |
+|---:|---|---|
+| 305 | uint8 | control_mode：0关闭，1 Iq，2速度，3位置，4限速位置轨迹，5旋钮触觉 |
+| 306 | int32 | 实时 Id，mA |
+| 310 | int32 | 实时 Iq，mA |
+| 314 | int32 | Iq 目标，mA |
+| 318 | uint32 | 控制命令看门狗剩余时间，ms |
+| 322 | int32 | 速度目标，millidegree/s |
+| 326 | int32 | PLL估算机械速度，millidegree/s |
+| 330 | int32 | 多圈机械位置目标，millidegree |
+| 334 | int32 | 多圈机械位置反馈，millidegree |
+
+### 11.5 `SET_IQ_CURRENT`（`0x09`）
+
+请求 Payload 为小端 `int32 iqTargetMa`。这是参考 VESC
+`CONTROL_MODE_CURRENT` 的第一版正式有感 FOC 电流模式：`Id_target=0`，正负
+`Iq` 决定正反力矩。当前安全范围为 `-300..+300 mA`；绝对值小于 10 mA
+（包括 0）立即关闭 PWM 和 EN_GATE，释放电机。
+
+非零命令要求功率级 READY、母线 6–10 V、无锁存故障、没有正在运行的
+commissioning 测试，并且 AS5600 电角度零位已经校准且样本新鲜。进入模式后，
+主机必须以短于 500 ms 的周期重复发送目标值；超时、编码器数据失效、功率级
+状态异常或保护触发都会由固件独立关断。`STOP (0x02)` 同样立即退出该模式。
+
+### 11.6 `SET_SPEED`（`0x0A`）
+
+请求 Payload 为小端 `int32 speedTargetMillidegreesPerSecond`。第一版正式有感
+速度模式采用 VESC 相同的级联结构：编码器 PLL 速度反馈经过速度 PI 产生 `Iq`
+目标，再由正式电流环执行。当前范围限制为 `-45000..+45000 millidegree/s`
+（±45 degree/s），速度模式 `Iq` 限制为 ±300 mA，加速度限制为 45 degree/s²，并使用
+±50 mA方向性起动转矩前馈克服低速齿槽。
+绝对目标小于 50 millidegree/s 时释放电机。非零命令的准入条件和 500 ms
+看门狗与 `SET_IQ_CURRENT` 相同。
+
+### 11.7 `SET_POSITION`（`0x0B`）
+
+请求 Payload 为小端 `int32 positionTargetMillidegrees`，范围为±3600000
+millidegree（±10圈），零点与 Sensor 服务的连续 `positionCounts` 一致。控制采用
+VESC式结构：位置P环直接生成 `Iq` 目标，再由电流PI执行。当前比例增益为
+0.04 A/degree，误差绝对值超过0.5 degree时叠加0.02 A静摩擦补偿，`Iq`硬限制为
+±0.15 A；编码器检查和500 ms命令看门狗保持不变。位置命令不会因目标为0而释放电机，必须使用
+`STOP (0x02)`退出保持。
+
+### 11.8 `SET_POSITION_PROFILE`（`0x0C`）
+
+推荐请求 Payload 为四个小端 `int32`：绝对多圈位置目标
+`positionTargetMillidegrees`、正数速度上限 `maximumSpeedMillidegreesPerSecond`、
+加速度 `accelerationMillidegreesPerSecondSquared` 和减速度
+`decelerationMillidegreesPerSecondSquared`。位置范围为 ±3600000 millidegree（±10圈），
+速度范围为 50..45000 millidegree/s，加减速度范围均为 100..90000
+millidegree/s²。固件生成带加速和提前减速的梯形/三角形位置轨迹，再由编码器位置误差
+直接产生受限 `Vq` 电压矢量，因此能够按指定速度转到指定圈数或角度。
+
+为兼容旧上位机，两个 `int32` 的 8 字节 Payload 仍然接受，此时加速度和减速度均使用
+10000 millidegree/s²。新实现 SHOULD 使用 16 字节 Payload。
+命令必须在 500 ms 看门狗期限内刷新，到达目标后继续保持位置，使用 `STOP (0x02)`释放。
+
+### 11.9 `SET_HAPTIC`（`0x0D`）
+
+请求 Payload 为五个小端 `int32`：卡点间隔（millidegree）、卡点强度（mA）、
+阻尼系数（mA/(degree/s)）、最小位置和最大位置（millidegree）。允许范围分别为
+100..360000、0..300、0..100，位置边界必须递增且位于 ±3600000 内。
+固件输出最近卡点的回正力矩、与转速成比例的阻尼以及位置边界的虚拟限位力矩，
+总 `Iq` 硬限制为 ±300 mA。该命令同样需要每 500 ms 内刷新并使用 `STOP` 退出。
+
+### 11.10 `SET_TORQUE`（`0x0E`）
+
+请求 Payload 为小端 `int32 torqueTargetMillinewtonMetres`，范围为 -69..+69 mN·m。
+固件按厂家参数 `Kt = 0.23 N·m/A` 换算为 `Iq`，并复用带 500 ms 看门狗的电流环；
+零力矩释放输出。实际轴力矩还会受到厂家力矩常数误差、温升和摩擦影响，因此这是估算力矩，
+若需要计量级力矩必须用力矩传感器标定。
 
 ### 11.2 `START_COMMISSIONING_TEST`（`0x01`）
 
@@ -800,6 +874,12 @@ CRC bytes:     60 0D
 | Motor | MEASURE_PHASE_RESISTANCE | `0x06` | Request/Response |
 | Motor | MEASURE_PHASE_INDUCTANCE | `0x07` | Request/Response |
 | Motor | MEASURE_FLUX_LINKAGE | `0x08` | Request/Response |
+| Motor | SET_IQ_CURRENT | `0x09` | Request/Response |
+| Motor | SET_SPEED | `0x0A` | Request/Response |
+| Motor | SET_POSITION | `0x0B` | Request/Response |
+| Motor | SET_POSITION_PROFILE | `0x0C` | Request/Response |
+| Motor | SET_HAPTIC | `0x0D` | Request/Response |
+| Motor | SET_TORQUE | `0x0E` | Request/Response |
 | Motor | MEASURE_RESISTANCE | `0x06` | Request/Response |
 | Diagnostic | SET_LOG_LEVEL | `0x00` | Request/Response |
 | Diagnostic | LOG | `0x80` | Event |
