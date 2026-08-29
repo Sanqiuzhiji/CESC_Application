@@ -13,11 +13,15 @@ typedef bool (*as5600_bus_ready_fn)(void *context, uint8_t address);
 typedef bool (*as5600_bus_read_fn)(void *context, uint8_t address,
                                   uint8_t reg, uint8_t *data,
                                   uint16_t length);
+typedef bool (*as5600_bus_write_fn)(void *context, uint8_t address,
+                                   uint8_t reg, const uint8_t *data,
+                                   uint16_t length);
 
 typedef struct {
   void *context;
   as5600_bus_ready_fn ready;
   as5600_bus_read_fn read;
+  as5600_bus_write_fn write;
 } as5600_bus_t;
 
 typedef enum {
@@ -34,6 +38,7 @@ typedef struct {
 
 bool as5600_init(as5600_t *device, const as5600_bus_t *bus);
 bool as5600_read_raw(as5600_t *device, uint16_t *raw);
+bool as5600_set_fast_filter(as5600_t *device);
 as5600_magnet_status_t as5600_read_magnet_status(as5600_t *device);
 
 #endif /* AS5600_H */

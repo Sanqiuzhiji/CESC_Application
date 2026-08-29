@@ -9,6 +9,7 @@
 #include "angle_sensor.h"
 #include "drv8301.h"
 #include "foc.h"
+#include "foc_observer.h"
 #include "motor_control_config.h"
 #include "main.h"
 #include "tim.h"
@@ -66,11 +67,19 @@ enum {
   FLUX_SAMPLE_START_MS = 4000U,
   FLUX_SAMPLE_END_MS = 9000U,
   CURRENT_TRANSFORM_DIAGNOSTIC_DIVIDER = 20U,
-  CURRENT_TRIP_ADC_COUNTS = 20U,
+  /* 40 counts is about 3.2 A. The measured 5.4-ohm phase and 8.1 V bus cannot
+   * sustain that current; this threshold rejects switching transients while
+   * DRV8301 hardware protection remains the final asynchronous safeguard. */
+  CURRENT_TRIP_ADC_COUNTS = 40U,
   CURRENT_TRIP_CONSECUTIVE_SAMPLES = 3U,
+  SOFTWARE_OVERSPEED_FAULT = 1U << 14,
   SOFTWARE_OVERCURRENT_FAULT = 1U << 15,
   COMMISSIONING_TEST_MODULATION_DIVISOR = 12U,
-  ADC_SAMPLE_TOP_MARGIN_COUNTS = 800U
+  /* VESC uses a second timer reset by every TIM1 update so the current ADCs
+   * sample shortly after both zero vectors (V0 and V7). At 168 MHz, 200
+   * counts gives the gate driver and current amplifiers about 1.19 us to
+   * settle after the PWM boundary. */
+  ADC_ZERO_VECTOR_SETTLE_COUNTS = 200U
 };
 
 #define ENCODER_CONTROL_MAX_SAMPLE_AGE_MS \
@@ -90,6 +99,8 @@ enum {
   (motor_control_config.minimum_active_iq_ma)
 #define CURRENT_FOC_MODULATION_DIVISOR \
   (motor_control_config.current_modulation_divisor)
+#define HIGH_SPEED_MODULATION_DIVISOR \
+  (motor_control_config.high_speed_modulation_divisor)
 #define DIRECT_VOLTAGE_MODULATION_DIVISOR \
   (motor_control_config.direct_voltage_modulation_divisor)
 
@@ -122,6 +133,7 @@ static volatile uint8_t test_steps_completed;
 static uint32_t test_settle_started_at;
 static int8_t test_direction;
 static volatile uint8_t overcurrent_count;
+static volatile uint8_t speed_voltage_phase_limit_count;
 typedef enum {
   TEST_KIND_NONE = 0,
   TEST_KIND_COMMUTATION,
@@ -251,10 +263,17 @@ static volatile int32_t control_id_ma;
 static volatile int32_t control_iq_ma;
 static volatile int32_t control_iq_target_ma;
 static volatile uint32_t control_command_at_ms;
+static volatile bool control_command_timeout_latched;
 static uint8_t control_sensor_invalid_count;
 static volatile int32_t control_speed_target_mdps;
 static volatile int32_t control_speed_actual_mdps;
 static volatile int32_t control_speed_voltage_q_counts;
+static float control_speed_voltage_integral_counts;
+static volatile int32_t control_speed_voltage_limit_counts;
+static volatile bool control_speed_voltage_current_limited;
+static volatile int32_t control_speed_voltage_fast_ceiling_counts;
+static volatile uint16_t control_speed_voltage_fast_limit_hold_cycles;
+static volatile bool control_speed_current_foc;
 static int32_t control_speed_sample_position_counts;
 static uint32_t control_speed_sample_timestamp_ms;
 static volatile int32_t control_position_target_mdeg;
@@ -279,9 +298,24 @@ static float current_foc_pll_speed_counts_per_second;
 static float current_foc_speed_reference_dps;
 static float current_foc_target_position_counts;
 static float current_foc_speed_integral_amps;
+static float current_foc_speed_iq_command_amps;
 static volatile float control_pll_phase_rad;
 static volatile float control_pll_speed_electrical_rad_per_second;
 static volatile bool control_pll_initialized;
+static uint32_t control_pll_sensor_sequence;
+static uint32_t control_pll_sensor_timestamp_ms;
+static volatile uint16_t control_pll_predicted_electrical_raw;
+static foc_observer_state_t speed_observer;
+static volatile uint16_t speed_observer_phase_raw;
+static volatile int16_t speed_observer_encoder_error_raw;
+static volatile int32_t speed_observer_erpm;
+static volatile bool speed_observer_using_encoder;
+static float precise_encoder_phase_raw;
+static uint32_t precise_encoder_last_cycles;
+static uint32_t precise_encoder_sensor_sequence;
+static bool precise_encoder_initialized;
+static float precise_encoder_blend;
+static bool precise_encoder_requested;
 
 static const float CURRENT_FOC_MAX_TARGET_AMPS = 0.30F;
 /*
@@ -306,8 +340,8 @@ static const float RESISTANCE_FOC_KI_COUNTS_PER_AMP_SECOND = 5000.0F;
 static const float CURRENT_FOC_POSITION_TO_SPEED_GAIN = 1.0F;
 static const float CURRENT_FOC_MAX_SPEED_TARGET_DPS = 15.0F;
 static const float CURRENT_FOC_ACCELERATION_DPS2 = 20.0F;
-static const float CURRENT_FOC_PLL_KP_PER_SECOND = 40.0F;
-static const float CURRENT_FOC_PLL_KI_PER_SECOND2 = 400.0F;
+static const float CURRENT_FOC_PLL_KP_PER_SECOND = 20.0F;
+static const float CURRENT_FOC_PLL_KI_PER_SECOND2 = 100.0F;
 static const float CURRENT_FOC_SPEED_KP_AMPS_PER_DPS = 0.002F;
 static const float CURRENT_FOC_SPEED_KI_AMPS_PER_DEGREE = 0.005F;
 #define CONTROL_SPEED_MAX_DPS \
@@ -403,9 +437,24 @@ static void reset_test_current_statistics(void)
   current_foc_speed_reference_dps = 0.0F;
   current_foc_target_position_counts = 0.0F;
   current_foc_speed_integral_amps = 0.0F;
+  current_foc_speed_iq_command_amps = 0.0F;
   control_pll_phase_rad = 0.0F;
   control_pll_speed_electrical_rad_per_second = 0.0F;
   control_pll_initialized = false;
+  control_pll_sensor_sequence = 0U;
+  control_pll_sensor_timestamp_ms = 0U;
+  control_pll_predicted_electrical_raw = 0U;
+  foc_observer_reset(&speed_observer, 0.0F);
+  speed_observer_phase_raw = 0U;
+  speed_observer_encoder_error_raw = 0;
+  speed_observer_erpm = 0;
+  speed_observer_using_encoder = true;
+  precise_encoder_phase_raw = 0.0F;
+  precise_encoder_last_cycles = 0U;
+  precise_encoder_sensor_sequence = 0U;
+  precise_encoder_initialized = false;
+  precise_encoder_blend = 0.0F;
+  precise_encoder_requested = false;
 }
 
 static void set_compare_values(uint16_t a, uint16_t b, uint16_t c);
@@ -495,7 +544,7 @@ static void finish_flux_measurement(void)
   flux_iq_ma = (int32_t)(flux_iq_sum_ma / flux_samples);
   flux_vq_mv = (int32_t)(flux_vq_sum_mv / flux_samples);
   const float omega_e = (float)flux_speed_mdps * 0.001F *
-      (3.14159265359F / 180.0F) * 11.0F;
+      (3.14159265359F / 180.0F) * (float)motor_control_config.pole_pairs;
   const float bemf_mv = (float)flux_vq_mv -
       (float)resistance_average_milliohms * (float)flux_iq_ma * 0.001F;
   if (fabsf(omega_e) < 0.5F || bemf_mv * omega_e <= 0.0F) {
@@ -510,9 +559,12 @@ static void finish_flux_measurement(void)
   }
   flux_linkage_uwb = (uint32_t)(linkage_wb * 1000000.0F);
   /* Datasheet Ke uses mechanical rad/s; dq flux linkage uses electrical rad/s. */
-  flux_ke_uv_per_rad_s = flux_linkage_uwb * 11U;
+  flux_ke_uv_per_rad_s =
+      flux_linkage_uwb * (uint32_t)motor_control_config.pole_pairs;
   flux_kv_millirpm_per_volt = (uint32_t)(
-      60000.0F / (2.0F * 3.14159265359F * 11.0F * linkage_wb));
+      60000.0F /
+      (2.0F * 3.14159265359F *
+       (float)motor_control_config.pole_pairs * linkage_wb));
   flux_valid = true;
 }
 
@@ -582,8 +634,45 @@ static void set_inductance_voltage(int8_t direction)
                      (uint16_t)(neutral - voltage_d / 2));
 }
 
+static void select_current_adc_trigger(uint32_t trigger)
+{
+  MODIFY_REG(ADC1->CR2, ADC_CR2_JEXTSEL, trigger);
+  MODIFY_REG(ADC2->CR2, ADC_CR2_JEXTSEL, trigger);
+  MODIFY_REG(ADC3->CR2, ADC_CR2_JEXTSEL, trigger);
+}
+
+/* Match the sampling timer arrangement used by VESC: TIM1 emits an update at
+ * both ends of its center-aligned count. That update resets TIM8, whose CC2
+ * event starts all three injected ADC conversions after a short settling
+ * delay. No TIM8 pin or interrupt is used. */
+static void configure_zero_vector_adc_sampler(void)
+{
+  __HAL_RCC_TIM8_CLK_ENABLE();
+
+  TIM8->CR1 = 0U;
+  TIM8->CR2 = 0U;
+  TIM8->SMCR = 0U;
+  TIM8->DIER = 0U;
+  TIM8->CCER = 0U;
+  TIM8->PSC = 0U;
+  TIM8->ARR = 0xFFFFU;
+  TIM8->CCR2 = ADC_ZERO_VECTOR_SETTLE_COUNTS;
+  TIM8->CCMR1 = TIM_CCMR1_OC2PE | (6U << TIM_CCMR1_OC2M_Pos);
+  TIM8->CCER = TIM_CCER_CC2E;
+  TIM8->BDTR = TIM_BDTR_MOE;
+  TIM8->EGR = TIM_EGR_UG;
+
+  /* On STM32F405, TIM8 ITR0 is TIM1 TRGO. Reset mode restarts the delay on
+   * both the top and bottom update events of center-aligned TIM1. */
+  MODIFY_REG(TIM1->CR2, TIM_CR2_MMS, TIM_TRGO_UPDATE);
+  TIM8->SMCR = TIM_SMCR_SMS_2;
+  TIM8->CR1 = TIM_CR1_ARPE | TIM_CR1_CEN;
+  select_current_adc_trigger(ADC_EXTERNALTRIGINJECCONV_T8_CC2);
+}
+
 static void configure_vesc_inductance_timer(void)
 {
+  select_current_adc_trigger(ADC_EXTERNALTRIGINJECCONV_T1_CC4);
   TIM1->CR1 |= TIM_CR1_UDIS;
   TIM1->ARR = VESC_INDUCTANCE_TIMER_ARR;
   TIM1->CCR1 = 0U;
@@ -603,10 +692,11 @@ static void restore_control_timer(void)
   TIM1->CCR1 = 2099U;
   TIM1->CCR2 = 2099U;
   TIM1->CCR3 = 2099U;
-  TIM1->CCR4 = 4199U - ADC_SAMPLE_TOP_MARGIN_COUNTS;
+  TIM1->CCR4 = 4199U - ADC_ZERO_VECTOR_SETTLE_COUNTS;
   TIM1->CNT = 0U;
   TIM1->CR1 &= ~TIM_CR1_UDIS;
   TIM1->EGR = TIM_EGR_UG;
+  select_current_adc_trigger(ADC_EXTERNALTRIGINJECCONV_T8_CC2);
 }
 
 static void finish_vesc_inductance_measurement(void)
@@ -670,11 +760,21 @@ static void set_commutation_step(uint8_t step)
 static uint16_t clamp_compare(uint16_t compare)
 {
   const uint16_t neutral = (uint16_t)(TIM1->ARR / 2U);
-  const uint16_t divisor =
-      ((test_kind == TEST_KIND_RESISTANCE) ||
-       (test_kind == TEST_KIND_INDUCTANCE)) ?
-      RESISTANCE_MODULATION_DIVISOR : COMMISSIONING_MODULATION_DIVISOR;
-  const uint16_t deviation = (uint16_t)(TIM1->ARR / divisor);
+  uint16_t deviation;
+  if ((control_mode == POWER_STAGE_CONTROL_SPEED) &&
+      !control_speed_current_foc &&
+      (control_speed_voltage_limit_counts > 0)) {
+    deviation = control_speed_voltage_limit_counts > (int32_t)neutral ?
+        neutral : (uint16_t)control_speed_voltage_limit_counts;
+  } else {
+    const uint16_t divisor =
+        ((test_kind == TEST_KIND_RESISTANCE) ||
+         (test_kind == TEST_KIND_INDUCTANCE)) ?
+        RESISTANCE_MODULATION_DIVISOR :
+        (control_speed_current_foc ? HIGH_SPEED_MODULATION_DIVISOR :
+                                    COMMISSIONING_MODULATION_DIVISOR);
+    deviation = (uint16_t)(TIM1->ARR / divisor);
+  }
   const uint16_t minimum = (uint16_t)(neutral - deviation);
   const uint16_t maximum = (uint16_t)(neutral + deviation);
   if (compare < minimum) {
@@ -699,6 +799,12 @@ void power_stage_disable(void)
   control_speed_target_mdps = 0;
   control_speed_actual_mdps = 0;
   control_speed_voltage_q_counts = 0;
+  control_speed_voltage_integral_counts = 0.0F;
+  control_speed_voltage_limit_counts = 0;
+  control_speed_voltage_current_limited = false;
+  control_speed_voltage_fast_ceiling_counts = 0;
+  control_speed_voltage_fast_limit_hold_cycles = 0U;
+  control_speed_current_foc = false;
   control_speed_sample_position_counts = 0;
   control_speed_sample_timestamp_ms = 0U;
   control_position_target_mdeg = 0;
@@ -719,7 +825,12 @@ void power_stage_disable(void)
   current_foc_active = false;
   current_foc_id_target = 0.0F;
   current_foc_iq_target = 0.0F;
+  current_foc_speed_reference_dps = 0.0F;
+  current_foc_speed_integral_amps = 0.0F;
+  current_foc_speed_iq_command_amps = 0.0F;
   control_pll_initialized = false;
+  control_pll_sensor_sequence = 0U;
+  control_pll_sensor_timestamp_ms = 0U;
   /* Gate all timer outputs before changing the individual channel enables. */
   TIM1->BDTR &= ~TIM_BDTR_MOE;
   TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC1NE |
@@ -771,6 +882,7 @@ bool power_stage_init(void)
   control_iq_ma = 0;
   control_iq_target_ma = 0;
   control_command_at_ms = 0U;
+  control_command_timeout_latched = false;
   control_sensor_invalid_count = 0U;
   control_speed_target_mdps = 0;
   control_speed_actual_mdps = 0;
@@ -790,6 +902,7 @@ bool power_stage_init(void)
   test_steps_completed = 0U;
   test_settle_started_at = 0U;
   overcurrent_count = 0U;
+  speed_voltage_phase_limit_count = 0U;
   for (uint32_t index = 0U; index < 3U; ++index) {
     current_raw[index] = 0U;
     current_offset[index] = 0U;
@@ -808,7 +921,8 @@ bool power_stage_init(void)
   }
 
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4,
-                        TIM1->ARR - ADC_SAMPLE_TOP_MARGIN_COUNTS);
+                        TIM1->ARR - ADC_ZERO_VECTOR_SETTLE_COUNTS);
+  configure_zero_vector_adc_sampler();
   if ((HAL_ADCEx_InjectedStart(&hadc2) != HAL_OK) ||
       (HAL_ADCEx_InjectedStart(&hadc3) != HAL_OK) ||
       (HAL_ADCEx_InjectedStart_IT(&hadc1) != HAL_OK) ||
@@ -856,6 +970,15 @@ void power_stage_process(void)
   }
 
   if (((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+       (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) &&
+      (llabs((long long)control_speed_actual_mdps) >
+       (long long)motor_control_config.maximum_speed_mdps * 11LL / 10LL)) {
+    power_stage_disable();
+    latched_faults |= SOFTWARE_OVERSPEED_FAULT;
+    stage_state = POWER_STAGE_FAULT;
+  }
+
+  if (((control_mode == POWER_STAGE_CONTROL_SPEED) ||
        (control_mode == POWER_STAGE_CONTROL_POSITION) ||
        (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE) ||
        (control_mode == POWER_STAGE_CONTROL_HAPTIC)) &&
@@ -870,6 +993,37 @@ void power_stage_process(void)
       const float dt = (float)elapsed_ms * 0.001F;
       control_position_actual_mdeg = (int32_t)(
           (int64_t)sample.position_counts * 360000LL / 4096LL);
+      if (((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+           (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) &&
+          (!control_speed_current_foc ||
+           !motor_control_config.high_speed_pll_prediction_enabled)) {
+        /* VESC-style position PLL for the outer speed loop. Unlike a
+         * one-sample finite difference, this does not turn AS5600 count
+         * quantization or an occasional delayed sample into an Iq spike. */
+        const float pll_error_counts =
+            (float)sample.position_counts - current_foc_pll_position_counts;
+        current_foc_pll_position_counts +=
+            (current_foc_pll_speed_counts_per_second +
+             CURRENT_FOC_PLL_KP_PER_SECOND * pll_error_counts) * dt;
+        current_foc_pll_speed_counts_per_second +=
+            CURRENT_FOC_PLL_KI_PER_SECOND2 * pll_error_counts * dt;
+        const float maximum_speed_counts_per_second =
+            CONTROL_SPEED_MAX_DPS * (4096.0F / 360.0F) * 1.2F;
+        if (current_foc_pll_speed_counts_per_second >
+            maximum_speed_counts_per_second) {
+          current_foc_pll_speed_counts_per_second =
+              maximum_speed_counts_per_second;
+        } else if (current_foc_pll_speed_counts_per_second <
+                   -maximum_speed_counts_per_second) {
+          current_foc_pll_speed_counts_per_second =
+              -maximum_speed_counts_per_second;
+        }
+        control_speed_actual_mdps = (int32_t)(
+            current_foc_pll_speed_counts_per_second *
+            (360000.0F / 4096.0F));
+        control_speed_sample_position_counts = sample.position_counts;
+        control_speed_sample_timestamp_ms = sample.timestamp_ms;
+      }
       if (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE) {
         const float remaining_mdeg = (float)(control_position_target_mdeg -
             control_position_profile_mdeg);
@@ -913,6 +1067,30 @@ void power_stage_process(void)
         } else {
           control_position_profile_mdeg += (int32_t)profile_step_mdeg;
         }
+        float profile_speed_correction_mdps =
+            (float)(control_position_profile_mdeg -
+                    control_position_actual_mdeg) *
+            motor_control_config.position_profile_following_kp_per_second;
+        const float profile_speed_limit =
+            (float)control_position_profile_speed_mdps;
+        const float profile_correction_limit = profile_speed_limit *
+            motor_control_config.position_profile_following_speed_fraction;
+        if (profile_speed_correction_mdps > profile_correction_limit) {
+          profile_speed_correction_mdps = profile_correction_limit;
+        } else if (profile_speed_correction_mdps <
+                   -profile_correction_limit) {
+          profile_speed_correction_mdps = -profile_correction_limit;
+        }
+        float profile_speed_command_mdps =
+            control_position_profile_velocity_mdps +
+            profile_speed_correction_mdps;
+        if (profile_speed_command_mdps > profile_speed_limit) {
+          profile_speed_command_mdps = profile_speed_limit;
+        } else if (profile_speed_command_mdps < -profile_speed_limit) {
+          profile_speed_command_mdps = -profile_speed_limit;
+        }
+        control_speed_target_mdps =
+            (int32_t)lroundf(profile_speed_command_mdps);
       }
       if (control_mode == POWER_STAGE_CONTROL_HAPTIC) {
         const int32_t spacing = control_haptic_spacing_mdeg;
@@ -940,11 +1118,8 @@ void power_stage_process(void)
         if (iq_ma < -maximum_ma) { iq_ma = -maximum_ma; }
         current_foc_iq_target = (float)iq_ma * 0.001F;
         control_iq_target_ma = iq_ma;
-      } else if ((control_mode == POWER_STAGE_CONTROL_POSITION) ||
-                 (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) {
-        const int32_t active_target =
-            control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE ?
-                control_position_profile_mdeg : control_position_target_mdeg;
+      } else if (control_mode == POWER_STAGE_CONTROL_POSITION) {
+        const int32_t active_target = control_position_target_mdeg;
         const float position_error_counts =
             (float)(active_target - control_position_actual_mdeg) *
             (4096.0F / 360000.0F);
@@ -964,11 +1139,30 @@ void power_stage_process(void)
         control_speed_voltage_q_counts = (int32_t)voltage_q_counts;
         current_foc_iq_target = 0.0F;
         control_iq_target_ma = 0;
+        const foc_pwm_output_t pwm = foc_oriented_voltage_to_pwm(
+            sample.electrical_raw, (int32_t)voltage_q_counts,
+            (uint16_t)TIM1->ARR);
+        set_compare_values(pwm.a, pwm.b, pwm.c);
       } else {
         const float requested_speed_dps =
             (float)control_speed_target_mdps * 0.001F;
-        const float reference_step = CONTROL_SPEED_ACCELERATION_DPS2 * dt;
-        if (current_foc_speed_reference_dps < requested_speed_dps) {
+        /* The direct-Vq path needs the already bench-proven gentle ramp.
+         * Once current FOC owns torque, use the faster user speed ramp. */
+        const float acceleration_dps2 =
+            motor_control_config.speed_current_foc_enabled ?
+                (control_speed_current_foc ?
+                     CONTROL_SPEED_ACCELERATION_DPS2 :
+                     (float)motor_control_config.low_speed_acceleration_mdps2 *
+                         0.001F) :
+                (float)motor_control_config.voltage_speed_acceleration_mdps2 *
+                    0.001F;
+        const float reference_step = acceleration_dps2 * dt;
+        if (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE) {
+          /* The trajectory generator already applies the user acceleration
+           * and deceleration limits. A second speed ramp made feedback lag
+           * the planned braking point and caused large target overshoot. */
+          current_foc_speed_reference_dps = requested_speed_dps;
+        } else if (current_foc_speed_reference_dps < requested_speed_dps) {
           current_foc_speed_reference_dps += reference_step;
           if (current_foc_speed_reference_dps > requested_speed_dps) {
             current_foc_speed_reference_dps = requested_speed_dps;
@@ -980,23 +1174,243 @@ void power_stage_process(void)
           }
         }
 
-        current_foc_target_position_counts +=
-            current_foc_speed_reference_dps * (4096.0F / 360.0F) * dt;
-        const float position_error_counts =
-            current_foc_target_position_counts - (float)sample.position_counts;
-        const float voltage_limit_counts = (float)(
-            TIM1->ARR / DIRECT_VOLTAGE_MODULATION_DIVISOR);
-        float voltage_q_counts = position_error_counts *
-            voltage_limit_counts /
-            CONTROL_SPEED_VOLTAGE_FULL_OUTPUT_ERROR_COUNTS;
-        if (voltage_q_counts > voltage_limit_counts) {
-          voltage_q_counts = voltage_limit_counts;
-        } else if (voltage_q_counts < -voltage_limit_counts) {
-          voltage_q_counts = -voltage_limit_counts;
+        const int32_t reference_abs_mdps = (int32_t)fabsf(
+            current_foc_speed_reference_dps * 1000.0F);
+        if (motor_control_config.speed_current_foc_enabled &&
+            !control_speed_current_foc &&
+            reference_abs_mdps >= motor_control_config.high_speed_enter_mdps) {
+          /* Enter current control without removing the q-axis voltage that
+           * is already carrying the rotor. This mirrors VESC's practice of
+           * keeping its voltage integrator continuous across control-state
+           * changes. Starting both Vq and Iq from zero made the rotor coast
+           * to a stop before the speed loop rebuilt torque. */
+          float transition_iq_amps = (float)control_iq_ma * 0.001F;
+          const float maximum_iq_amps =
+              (float)motor_control_config.maximum_iq_ma * 0.001F;
+          if (transition_iq_amps > maximum_iq_amps) {
+            transition_iq_amps = maximum_iq_amps;
+          } else if (transition_iq_amps < -maximum_iq_amps) {
+            transition_iq_amps = -maximum_iq_amps;
+          }
+          control_speed_current_foc = true;
+          current_foc_integral_d = 0.0F;
+          current_foc_integral_q = (float)control_speed_voltage_q_counts;
+          current_foc_speed_integral_amps = 0.0F;
+          current_foc_speed_iq_command_amps = transition_iq_amps;
+          current_foc_id_target = 0.0F;
+          current_foc_iq_target = transition_iq_amps;
+          control_speed_voltage_q_counts = 0;
+          control_speed_voltage_integral_counts = 0.0F;
+          control_pll_initialized = false;
+        } else if (motor_control_config.speed_current_foc_enabled &&
+                   control_speed_current_foc &&
+                   reference_abs_mdps <=
+                       motor_control_config.high_speed_exit_mdps) {
+          control_speed_current_foc = false;
+          current_foc_integral_d = 0.0F;
+          current_foc_integral_q = 0.0F;
+          current_foc_speed_integral_amps = 0.0F;
+          current_foc_speed_iq_command_amps = 0.0F;
+          current_foc_target_position_counts = (float)sample.position_counts;
         }
-        control_speed_voltage_q_counts = (int32_t)voltage_q_counts;
-        current_foc_iq_target = 0.0F;
-        control_iq_target_ma = 0;
+
+        if (control_speed_current_foc) {
+          const float actual_speed_dps =
+              (float)control_speed_actual_mdps * 0.001F;
+          const float target_erpm = current_foc_speed_reference_dps *
+              (CONTROL_MOTOR_POLE_PAIRS / 6.0F);
+          const float actual_erpm = actual_speed_dps *
+              (CONTROL_MOTOR_POLE_PAIRS / 6.0F);
+          const float speed_error_erpm = target_erpm - actual_erpm;
+          const float maximum_iq =
+              (float)motor_control_config.maximum_iq_ma * 0.001F;
+          current_foc_speed_integral_amps += speed_error_erpm *
+              motor_control_config.speed_pid_ki *
+              motor_control_config.speed_pid_normalization * dt * maximum_iq;
+          if (current_foc_speed_integral_amps > maximum_iq) {
+            current_foc_speed_integral_amps = maximum_iq;
+          } else if (current_foc_speed_integral_amps < -maximum_iq) {
+            current_foc_speed_integral_amps = -maximum_iq;
+          }
+          float iq_target = speed_error_erpm *
+              motor_control_config.speed_pid_kp *
+              motor_control_config.speed_pid_normalization * maximum_iq +
+              current_foc_speed_integral_amps;
+          if (current_foc_speed_reference_dps > 0.0F) {
+            iq_target += motor_control_config.speed_current_feedforward_amp;
+          } else if (current_foc_speed_reference_dps < 0.0F) {
+            iq_target -= motor_control_config.speed_current_feedforward_amp;
+          }
+          if (iq_target > maximum_iq) {
+            iq_target = maximum_iq;
+            if (speed_error_erpm > 0.0F) {
+              current_foc_speed_integral_amps -= speed_error_erpm *
+                  motor_control_config.speed_pid_ki *
+                  motor_control_config.speed_pid_normalization * dt *
+                  maximum_iq;
+            }
+          } else if (iq_target < -maximum_iq) {
+            iq_target = -maximum_iq;
+            if (speed_error_erpm < 0.0F) {
+              current_foc_speed_integral_amps -= speed_error_erpm *
+                  motor_control_config.speed_pid_ki *
+                  motor_control_config.speed_pid_normalization * dt *
+                  maximum_iq;
+            }
+          }
+          /* VESC ramps externally requested setpoints before the current
+           * controller. Keep the same separation here so entering the
+           * high-speed path cannot step directly from Vq to breakaway Iq. */
+          const float iq_step =
+              motor_control_config.speed_iq_ramp_amp_per_second * dt;
+          if (current_foc_speed_iq_command_amps < iq_target) {
+            current_foc_speed_iq_command_amps += iq_step;
+            if (current_foc_speed_iq_command_amps > iq_target) {
+              current_foc_speed_iq_command_amps = iq_target;
+            }
+          } else if (current_foc_speed_iq_command_amps > iq_target) {
+            current_foc_speed_iq_command_amps -= iq_step;
+            if (current_foc_speed_iq_command_amps < iq_target) {
+              current_foc_speed_iq_command_amps = iq_target;
+            }
+          }
+          current_foc_id_target = 0.0F;
+          current_foc_iq_target = current_foc_speed_iq_command_amps;
+          control_iq_target_ma =
+              (int32_t)(current_foc_speed_iq_command_amps * 1000.0F);
+        } else {
+          const float low_speed_limit_counts = (float)(
+              TIM1->ARR / DIRECT_VOLTAGE_MODULATION_DIVISOR);
+          float maximum_limit_counts = (float)(
+              TIM1->ARR /
+              motor_control_config.speed_voltage_max_modulation_divisor);
+          if (maximum_limit_counts > (float)motor_control_config.
+                  speed_voltage_safe_sample_max_counts) {
+            maximum_limit_counts = (float)motor_control_config.
+                speed_voltage_safe_sample_max_counts;
+          }
+          float speed_ratio = (float)reference_abs_mdps /
+              (float)motor_control_config.speed_voltage_full_scale_mdps;
+          if (speed_ratio > 1.0F) { speed_ratio = 1.0F; }
+          const float voltage_limit_counts = low_speed_limit_counts +
+              (maximum_limit_counts - low_speed_limit_counts) * speed_ratio;
+          if (control_speed_voltage_fast_ceiling_counts <= 0) {
+            control_speed_voltage_fast_ceiling_counts =
+                (int32_t)low_speed_limit_counts;
+          } else if ((control_speed_voltage_fast_limit_hold_cycles == 0U) &&
+                     (control_speed_voltage_fast_ceiling_counts <
+                      (int32_t)voltage_limit_counts)) {
+            int32_t recovery = (int32_t)(motor_control_config.
+                speed_voltage_limit_recovery_counts_per_second * dt);
+            if (recovery < 1) { recovery = 1; }
+            control_speed_voltage_fast_ceiling_counts += recovery;
+            if (control_speed_voltage_fast_ceiling_counts >
+                (int32_t)voltage_limit_counts) {
+              control_speed_voltage_fast_ceiling_counts =
+                  (int32_t)voltage_limit_counts;
+            }
+          }
+          const float effective_voltage_limit_counts =
+              control_speed_voltage_fast_ceiling_counts <
+                      (int32_t)voltage_limit_counts ?
+                  (float)control_speed_voltage_fast_ceiling_counts :
+                  voltage_limit_counts;
+          control_speed_voltage_limit_counts =
+              (int32_t)effective_voltage_limit_counts;
+          const float speed_error_dps = current_foc_speed_reference_dps -
+              (float)control_speed_actual_mdps * 0.001F;
+          float speed_gain_scale = 1.0F;
+          if (reference_abs_mdps > motor_control_config.
+                  speed_voltage_gain_reduction_start_mdps) {
+            const int32_t reduction_range =
+                motor_control_config.maximum_speed_mdps -
+                motor_control_config.speed_voltage_gain_reduction_start_mdps;
+            float reduction_ratio = reduction_range > 0 ?
+                (float)(reference_abs_mdps - motor_control_config.
+                    speed_voltage_gain_reduction_start_mdps) /
+                    (float)reduction_range : 1.0F;
+            if (reduction_ratio > 1.0F) { reduction_ratio = 1.0F; }
+            speed_gain_scale = 1.0F - reduction_ratio *
+                (1.0F - motor_control_config.
+                    speed_voltage_high_speed_gain_scale);
+          }
+          const float feedforward_counts =
+              current_foc_speed_reference_dps *
+              motor_control_config.speed_voltage_feedforward_counts_per_dps;
+          const float proportional_counts = speed_error_dps *
+              motor_control_config.speed_voltage_kp_counts_per_dps *
+              speed_gain_scale;
+          const float previous_integral =
+              control_speed_voltage_integral_counts;
+          control_speed_voltage_integral_counts += speed_error_dps *
+              motor_control_config.speed_voltage_ki_counts_per_degree *
+              speed_gain_scale * dt;
+          const float integral_limit = motor_control_config.
+              speed_voltage_integral_limit_counts;
+          if (control_speed_voltage_integral_counts > integral_limit) {
+            control_speed_voltage_integral_counts = integral_limit;
+          } else if (control_speed_voltage_integral_counts < -integral_limit) {
+            control_speed_voltage_integral_counts = -integral_limit;
+          }
+          float voltage_q_counts = feedforward_counts +
+              proportional_counts + control_speed_voltage_integral_counts;
+
+          /* VESC-style conditional integration: when the requested voltage
+           * is saturated in the same direction as the speed error, undo this
+           * cycle's integrator update instead of winding it further. */
+          if (((voltage_q_counts > effective_voltage_limit_counts) &&
+               (speed_error_dps > 0.0F)) ||
+              ((voltage_q_counts < -effective_voltage_limit_counts) &&
+               (speed_error_dps < 0.0F))) {
+            control_speed_voltage_integral_counts = previous_integral;
+            voltage_q_counts = feedforward_counts + proportional_counts +
+                control_speed_voltage_integral_counts;
+          }
+
+          /* The present shunt chain resolves about 80.6 mA/count, so it is
+           * unsuitable as a precision torque loop. It can still prevent a
+           * voltage command from increasing when the coarse Iq estimate is
+           * already beyond the configured current envelope. */
+          const bool positive_overcurrent =
+              (control_iq_ma > motor_control_config.
+                  speed_voltage_slow_current_limit_ma) &&
+              (voltage_q_counts > (float)control_speed_voltage_q_counts);
+          const bool negative_overcurrent =
+              (control_iq_ma < -motor_control_config.
+                  speed_voltage_slow_current_limit_ma) &&
+              (voltage_q_counts < (float)control_speed_voltage_q_counts);
+          control_speed_voltage_current_limited =
+              positive_overcurrent || negative_overcurrent ||
+              (control_speed_voltage_fast_limit_hold_cycles > 0U);
+          if (positive_overcurrent || negative_overcurrent) {
+            const float decay = motor_control_config.
+                speed_voltage_current_limit_decay_per_second * dt;
+            voltage_q_counts = (float)control_speed_voltage_q_counts *
+                (decay < 1.0F ? (1.0F - decay) : 0.0F);
+          }
+          if (voltage_q_counts > effective_voltage_limit_counts) {
+            voltage_q_counts = effective_voltage_limit_counts;
+          } else if (voltage_q_counts < -effective_voltage_limit_counts) {
+            voltage_q_counts = -effective_voltage_limit_counts;
+          }
+          const float voltage_slew_step = motor_control_config.
+              speed_voltage_slew_counts_per_second * dt;
+          const float previous_voltage_q =
+              (float)control_speed_voltage_q_counts;
+          if (voltage_q_counts > previous_voltage_q + voltage_slew_step) {
+            voltage_q_counts = previous_voltage_q + voltage_slew_step;
+          } else if (voltage_q_counts <
+                     previous_voltage_q - voltage_slew_step) {
+            voltage_q_counts = previous_voltage_q - voltage_slew_step;
+          }
+          control_speed_voltage_q_counts = (int32_t)voltage_q_counts;
+          current_foc_iq_target = 0.0F;
+          control_iq_target_ma = 0;
+          const foc_pwm_output_t pwm = foc_oriented_voltage_to_pwm(
+              sample.electrical_raw, (int32_t)voltage_q_counts,
+              (uint16_t)TIM1->ARR);
+          set_compare_values(pwm.a, pwm.b, pwm.c);
+        }
       }
       current_foc_outer_last_ms = now;
     }
@@ -1447,6 +1861,13 @@ void power_stage_process(void)
       (test_kind == TEST_KIND_ENCODER_ALIGNMENT)) {
     const uint32_t alignment_elapsed =
         (uint32_t)(now - test_started_at);
+    if (alignment_elapsed < CURRENT_FOC_ALIGNMENT_RAMP_UP_MS) {
+      current_foc_id_target = CURRENT_FOC_MAX_TARGET_AMPS *
+          (float)alignment_elapsed /
+          (float)CURRENT_FOC_ALIGNMENT_RAMP_UP_MS;
+    } else {
+      current_foc_id_target = CURRENT_FOC_MAX_TARGET_AMPS;
+    }
     if ((stage_state != POWER_STAGE_RUNNING) ||
         (alignment_elapsed >= ENCODER_ALIGNMENT_TIMEOUT_MS)) {
       power_stage_disable();
@@ -1535,6 +1956,9 @@ void power_stage_process(void)
 
 bool power_stage_enable(uint16_t duty_a, uint16_t duty_b, uint16_t duty_c)
 {
+  if (control_command_timeout_latched) {
+    return false;
+  }
   if ((stage_state != POWER_STAGE_READY) ||
       (HAL_GPIO_ReadPin(DRV_FAULT_N_GPIO_Port, DRV_FAULT_N_Pin) ==
        GPIO_PIN_RESET)) {
@@ -1610,7 +2034,6 @@ bool power_stage_start_commissioning_test(int8_t direction)
 bool power_stage_start_encoder_alignment(void)
 {
   const uint16_t neutral = (uint16_t)(TIM1->ARR / 2U);
-  const uint16_t delta = (uint16_t)(TIM1->ARR / 10U);
 
   if ((stage_state != POWER_STAGE_READY) || !bus_voltage_valid ||
       (bus_voltage_mv < COMMISSIONING_MIN_BUS_MV) ||
@@ -1632,12 +2055,12 @@ bool power_stage_start_encoder_alignment(void)
   reset_foc_control_statistics();
   current_foc_integral_d = 0.0F;
   current_foc_integral_q = 0.0F;
-  current_foc_id_target = CURRENT_FOC_MAX_TARGET_AMPS;
+  current_foc_id_target = 0.0F;
   current_foc_iq_target = 0.0F;
-  /* Initial 0-degree vector: cos(0), cos(-120), cos(120). */
-  if (!power_stage_enable((uint16_t)(neutral + delta),
-                          (uint16_t)(neutral - delta / 2U),
-                          (uint16_t)(neutral - delta / 2U))) {
+  /* Start from a neutral vector. The 20 kHz d-axis current controller ramps
+   * the locking current over 600 ms, avoiding a simultaneous voltage and
+   * current-reference step when the MOSFET bridge is enabled. */
+  if (!power_stage_enable(neutral, neutral, neutral)) {
     test_state = POWER_STAGE_TEST_ABORTED;
     test_kind = TEST_KIND_NONE;
     return false;
@@ -1721,6 +2144,7 @@ bool power_stage_start_current_foc_test(int8_t direction)
     current_foc_speed_reference_dps = 0.0F;
     current_foc_target_position_counts = (float)sample.position_counts;
     current_foc_speed_integral_amps = 0.0F;
+    current_foc_speed_iq_command_amps = 0.0F;
     control_speed_actual_mdps = 0;
     control_speed_sample_position_counts = sample.position_counts;
     control_speed_sample_timestamp_ms = sample.timestamp_ms;
@@ -1842,6 +2266,7 @@ bool power_stage_set_iq_current_ma(int32_t iq_target_ma)
     current_foc_id_target = 0.0F;
     current_foc_iq_target = 0.0F;
     overcurrent_count = 0U;
+    speed_voltage_phase_limit_count = 0U;
     if (!power_stage_enable(neutral, neutral, neutral)) {
       return false;
     }
@@ -1890,6 +2315,21 @@ bool power_stage_set_speed_millidegrees_per_second(int32_t speed_target)
       (control_mode != POWER_STAGE_CONTROL_SPEED)) {
     power_stage_disable();
   }
+  /* Once speed control is running, repeated host commands are watchdog and
+   * setpoint refreshes. Do not reject one merely because the lock-free
+   * encoder snapshot was being published during this exact protocol call;
+   * the control loop independently validates every subsequent sample. */
+  if (control_mode == POWER_STAGE_CONTROL_SPEED) {
+    if ((stage_state != POWER_STAGE_RUNNING) || !current_foc_active ||
+        (latched_faults != 0U) || !bus_voltage_valid ||
+        (bus_voltage_mv < COMMISSIONING_MIN_BUS_MV) ||
+        (bus_voltage_mv > COMMISSIONING_MAX_BUS_MV)) {
+      return false;
+    }
+    control_speed_target_mdps = speed_target;
+    control_command_at_ms = now;
+    return true;
+  }
   if ((test_state == POWER_STAGE_TEST_RUNNING) ||
       ((stage_state != POWER_STAGE_READY) &&
        (control_mode != POWER_STAGE_CONTROL_SPEED)) ||
@@ -1916,8 +2356,33 @@ bool power_stage_set_speed_millidegrees_per_second(int32_t speed_target)
     current_foc_target_position_counts = (float)sample.position_counts;
     current_foc_speed_integral_amps = 0.0F;
     control_speed_voltage_q_counts = 0;
+    control_speed_voltage_integral_counts = 0.0F;
+    control_speed_voltage_fast_ceiling_counts =
+        (int32_t)(TIM1->ARR / DIRECT_VOLTAGE_MODULATION_DIVISOR);
+    control_speed_voltage_fast_limit_hold_cycles = 0U;
+    control_speed_voltage_current_limited = false;
+    control_speed_actual_mdps = 0;
+    control_speed_sample_position_counts = sample.position_counts;
+    control_speed_sample_timestamp_ms = sample.timestamp_ms;
+    control_pll_phase_rad = 0.0F;
+    control_pll_speed_electrical_rad_per_second = 0.0F;
+    control_pll_initialized = false;
+    control_pll_sensor_sequence = 0U;
+    foc_observer_reset(&speed_observer,
+        (float)sample.electrical_raw * (6.28318530718F / 4096.0F));
+    speed_observer_phase_raw = sample.electrical_raw;
+    speed_observer_encoder_error_raw = 0;
+    speed_observer_erpm = 0;
+    speed_observer_using_encoder = true;
+    precise_encoder_phase_raw = (float)sample.electrical_raw;
+    precise_encoder_last_cycles = DWT->CYCCNT;
+    precise_encoder_sensor_sequence = 0U;
+    precise_encoder_initialized = false;
+    precise_encoder_blend = 0.0F;
+    precise_encoder_requested = false;
     current_foc_outer_last_ms = now;
     overcurrent_count = 0U;
+    speed_voltage_phase_limit_count = 0U;
     if (!power_stage_enable(neutral, neutral, neutral)) {
       return false;
     }
@@ -1972,6 +2437,21 @@ bool power_stage_set_position_millidegrees(int32_t position_target)
     control_speed_actual_mdps = 0;
     control_speed_sample_position_counts = sample.position_counts;
     control_speed_sample_timestamp_ms = sample.timestamp_ms;
+    control_speed_voltage_q_counts = 0;
+    control_speed_voltage_integral_counts = 0.0F;
+    control_speed_voltage_fast_ceiling_counts =
+        (int32_t)(TIM1->ARR / DIRECT_VOLTAGE_MODULATION_DIVISOR);
+    control_speed_voltage_fast_limit_hold_cycles = 0U;
+    control_speed_voltage_current_limited = false;
+    control_speed_current_foc = false;
+    foc_observer_reset(&speed_observer,
+        (float)sample.electrical_raw * (6.28318530718F / 4096.0F));
+    precise_encoder_phase_raw = (float)sample.electrical_raw;
+    precise_encoder_last_cycles = DWT->CYCCNT;
+    precise_encoder_sensor_sequence = 0U;
+    precise_encoder_initialized = false;
+    precise_encoder_blend = 0.0F;
+    precise_encoder_requested = false;
     overcurrent_count = 0U;
     if (!power_stage_enable(neutral, neutral, neutral)) {
       return false;
@@ -2001,7 +2481,7 @@ bool power_stage_set_position_profile(int32_t position_target,
         motor_control_config.default_profile_acceleration_mdps2;
   }
   if (maximum_speed_mdps < motor_control_config.minimum_speed_mdps ||
-      maximum_speed_mdps > motor_control_config.maximum_speed_mdps ||
+      maximum_speed_mdps > motor_control_config.maximum_profile_speed_mdps ||
       acceleration_mdps2 <
           motor_control_config.minimum_profile_acceleration_mdps2 ||
       acceleration_mdps2 >
@@ -2080,6 +2560,12 @@ void power_stage_stop_commissioning_test(void)
     test_state = POWER_STAGE_TEST_ABORTED;
     test_kind = TEST_KIND_NONE;
   }
+  control_command_timeout_latched = false;
+}
+
+bool power_stage_is_command_timeout_latched(void)
+{
+  return control_command_timeout_latched;
 }
 
 power_stage_test_state_t power_stage_get_test_state(void)
@@ -2099,15 +2585,15 @@ power_stage_state_t power_stage_get_state(void)
 
 bool power_stage_get_current_sample(power_stage_current_sample_t *sample)
 {
-  uint32_t sequence_before;
-  uint32_t sequence_after;
-
   if (sample == NULL) {
     return false;
   }
 
-  do {
-    sequence_before = current_sequence;
+  /* Diagnostics run in the main loop while the ADC ISR publishes at 20 kHz.
+   * Never let a telemetry request spin indefinitely waiting for a quiet
+   * window; a later protocol frame can retry a missed snapshot. */
+  for (uint32_t attempt = 0U; attempt < 3U; ++attempt) {
+    const uint32_t sequence_before = current_sequence;
     if ((sequence_before & 1U) != 0U) {
       continue;
     }
@@ -2117,12 +2603,15 @@ bool power_stage_get_current_sample(power_stage_current_sample_t *sample)
       sample->centered[index] =
           (int32_t)sample->raw[index] - (int32_t)sample->offset[index];
     }
-    sequence_after = current_sequence;
-  } while ((sequence_before != sequence_after) ||
-           ((sequence_after & 1U) != 0U));
+    const uint32_t sequence_after = current_sequence;
+    if ((sequence_before == sequence_after) &&
+        ((sequence_after & 1U) == 0U)) {
+      sample->sequence = sequence_after >> 1U;
+      return true;
+    }
+  }
 
-  sample->sequence = sequence_after >> 1U;
-  return true;
+  return false;
 }
 
 uint16_t power_stage_get_latched_faults(void)
@@ -2214,6 +2703,18 @@ bool power_stage_get_diagnostics(power_stage_diagnostics_t *diagnostics)
   diagnostics->control_id_ma = control_id_ma;
   diagnostics->control_iq_ma = control_iq_ma;
   diagnostics->control_iq_target_ma = control_iq_target_ma;
+  diagnostics->control_speed_voltage_q_counts =
+      control_speed_voltage_q_counts;
+  diagnostics->control_speed_voltage_limit_counts =
+      control_speed_voltage_limit_counts;
+  diagnostics->control_speed_voltage_current_limited =
+      control_speed_voltage_current_limited ? 1U : 0U;
+  diagnostics->observer_phase_raw = speed_observer_phase_raw;
+  diagnostics->observer_encoder_error_raw =
+      speed_observer_encoder_error_raw;
+  diagnostics->observer_erpm = speed_observer_erpm;
+  diagnostics->observer_using_encoder =
+      speed_observer_using_encoder ? 1U : 0U;
   diagnostics->control_timeout_remaining_ms =
       control_mode == POWER_STAGE_CONTROL_DISABLED ? 0U :
       ((uint32_t)(HAL_GetTick() - control_command_at_ms) >=
@@ -2228,6 +2729,28 @@ bool power_stage_get_diagnostics(power_stage_diagnostics_t *diagnostics)
       control_position_target_mdeg;
   diagnostics->control_position_millidegrees =
       control_position_actual_mdeg;
+  diagnostics->control_speed_current_foc =
+      control_speed_current_foc ? 1U : 0U;
+  diagnostics->control_speed_reference_millidegrees_per_second = (int32_t)(
+      current_foc_speed_reference_dps * 1000.0F);
+  diagnostics->control_predicted_electrical_raw =
+      control_pll_predicted_electrical_raw;
+  const uint32_t now_ms = HAL_GetTick();
+  angle_sensor_sample_t latest_angle_sample;
+  diagnostics->control_encoder_sample_age_ms =
+      angle_sensor_get_sample(&latest_angle_sample) ?
+          now_ms - latest_angle_sample.timestamp_ms : UINT32_MAX;
+  uint16_t measured_electrical_raw = 0U;
+  (void)angle_sensor_get_electrical_raw_fast(&measured_electrical_raw);
+  int32_t prediction_error =
+      (int32_t)control_pll_predicted_electrical_raw -
+      (int32_t)measured_electrical_raw;
+  if (prediction_error > 2047) {
+    prediction_error -= 4096;
+  } else if (prediction_error < -2048) {
+    prediction_error += 4096;
+  }
+  diagnostics->control_prediction_error_raw = (int16_t)prediction_error;
   for (uint32_t phase = 0U; phase < 3U; ++phase) {
     diagnostics->test_current_sum[phase] = test_current_sum[phase];
     diagnostics->test_current_min[phase] = test_current_min[phase];
@@ -2250,11 +2773,44 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
       (uint16_t)HAL_ADCEx_InjectedGetValue(&hadc3, ADC_INJECTED_RANK_1)
   };
 
+  if (control_speed_voltage_fast_limit_hold_cycles > 0U) {
+    --control_speed_voltage_fast_limit_hold_cycles;
+  }
+
   ++current_sequence;
   for (uint32_t index = 0U; index < 3U; ++index) {
     current_raw[index] = samples[index];
   }
   ++current_sequence;
+
+  /* This deadline is enforced in the 20 kHz ADC interrupt, independently of
+   * USB and the RTOS status task. A stalled protocol/telemetry path therefore
+   * cannot leave an externally commanded motor energized indefinitely. */
+  if ((control_mode != POWER_STAGE_CONTROL_DISABLED) &&
+      ((uint32_t)(HAL_GetTick() - control_command_at_ms) >=
+       CONTROL_COMMAND_TIMEOUT_MS)) {
+    control_command_timeout_latched = true;
+    control_mode = POWER_STAGE_CONTROL_DISABLED;
+    current_foc_active = false;
+    current_foc_id_target = 0.0F;
+    current_foc_iq_target = 0.0F;
+    current_foc_integral_d = 0.0F;
+    current_foc_integral_q = 0.0F;
+    control_speed_target_mdps = 0;
+    control_speed_voltage_q_counts = 0;
+    TIM1->BDTR &= ~TIM_BDTR_MOE;
+    TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC1NE |
+                    TIM_CCER_CC2E | TIM_CCER_CC2NE |
+                    TIM_CCER_CC3E | TIM_CCER_CC3NE);
+    DRV_EN_GATE_GPIO_Port->BSRR =
+        (uint32_t)DRV_EN_GATE_Pin << 16U;
+    if ((TIM1->CCER & TIM_CCER_CC4E) != 0U) {
+      TIM1->BDTR |= TIM_BDTR_MOE;
+    }
+    if (stage_state == POWER_STAGE_RUNNING) {
+      stage_state = POWER_STAGE_READY;
+    }
+  }
 
   if ((test_state == POWER_STAGE_TEST_RUNNING) &&
       (((test_kind == TEST_KIND_RESISTANCE) &&
@@ -2297,6 +2853,37 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         (int32_t)CURRENT_TRIP_ADC_COUNTS;
     int32_t balance = 0;
     int32_t centered_samples[3];
+    /* At the fixed low-side-shunt sampling point, one phase can be hidden by
+     * the active SVM vector. Match the reconstruction selection used below
+     * and never treat that unobservable channel's switching transient as a
+     * real phase overcurrent. The remaining two measured phases still fully
+     * determine the motor currents. */
+    const bool current_sample_v7 =
+        (test_kind != TEST_KIND_RESISTANCE) &&
+        (test_kind != TEST_KIND_INDUCTANCE) &&
+        ((TIM1->CR1 & TIM_CR1_DIR) == 0U);
+    uint32_t unobservable_phase = 3U;
+    if (current_sample_v7) {
+      if ((TIM1->CCR1 < TIM1->CCR2) && (TIM1->CCR1 < TIM1->CCR3)) {
+        unobservable_phase = 0U;
+      } else if ((TIM1->CCR2 < TIM1->CCR1) &&
+                 (TIM1->CCR2 < TIM1->CCR3)) {
+        unobservable_phase = 1U;
+      } else if ((TIM1->CCR3 < TIM1->CCR1) &&
+                 (TIM1->CCR3 < TIM1->CCR2)) {
+        unobservable_phase = 2U;
+      }
+    } else {
+      if ((TIM1->CCR1 > TIM1->CCR2) && (TIM1->CCR1 > TIM1->CCR3)) {
+        unobservable_phase = 0U;
+      } else if ((TIM1->CCR2 > TIM1->CCR1) &&
+                 (TIM1->CCR2 > TIM1->CCR3)) {
+        unobservable_phase = 1U;
+      } else if ((TIM1->CCR3 > TIM1->CCR1) &&
+                 (TIM1->CCR3 > TIM1->CCR2)) {
+        unobservable_phase = 2U;
+      }
+    }
     for (uint32_t index = 0U; index < 3U; ++index) {
       const int32_t centered =
           (int32_t)samples[index] - (int32_t)current_offset[index];
@@ -2309,9 +2896,59 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
       if (centered > test_current_max[index]) {
         test_current_max[index] = (int16_t)centered;
       }
-      if ((centered > current_trip_counts) ||
-          (centered < -current_trip_counts)) {
+      if ((index != unobservable_phase) &&
+          ((centered > current_trip_counts) ||
+           (centered < -current_trip_counts))) {
         overcurrent = true;
+      }
+    }
+
+    /* VESC-style fast protection for encoder-feedback voltage modes. The
+     * slower d/q diagnostic is intentionally decimated and can miss PWM-rate
+     * phase-current peaks. Back the commanded voltage off in this ISR before
+     * the independent hard-trip threshold is reached. */
+    const bool direct_speed_voltage_control =
+        (control_mode == POWER_STAGE_CONTROL_SPEED) &&
+        !control_speed_current_foc && current_foc_active;
+    if (direct_speed_voltage_control) {
+      bool phase_current_limited = false;
+      const int32_t phase_limit = (int32_t)motor_control_config.
+          speed_voltage_phase_current_limit_adc_counts;
+      for (uint32_t index = 0U; index < 3U; ++index) {
+        if ((index != unobservable_phase) &&
+            ((centered_samples[index] > phase_limit) ||
+             (centered_samples[index] < -phase_limit))) {
+          phase_current_limited = true;
+        }
+      }
+      speed_voltage_phase_limit_count = phase_current_limited ?
+          (uint8_t)(speed_voltage_phase_limit_count + 1U) : 0U;
+      if (speed_voltage_phase_limit_count >=
+          CURRENT_TRIP_CONSECUTIVE_SAMPLES) {
+        speed_voltage_phase_limit_count = 0U;
+        const uint8_t decay_shift = motor_control_config.
+            speed_voltage_fast_limit_decay_shift;
+        int32_t voltage_q = control_speed_voltage_q_counts;
+        int32_t reduction = decay_shift < 31U ?
+            (voltage_q < 0 ? -voltage_q : voltage_q) >> decay_shift : 0;
+        if (reduction < 1) { reduction = 1; }
+        if (voltage_q > 0) {
+          voltage_q = voltage_q > reduction ? voltage_q - reduction : 0;
+        } else if (voltage_q < 0) {
+          voltage_q = voltage_q < -reduction ? voltage_q + reduction : 0;
+        }
+        control_speed_voltage_q_counts = voltage_q;
+        if (control_speed_voltage_fast_ceiling_counts >
+            (voltage_q < 0 ? -voltage_q : voltage_q)) {
+          control_speed_voltage_fast_ceiling_counts =
+              voltage_q < 0 ? -voltage_q : voltage_q;
+        }
+        uint32_t hold_cycles = (uint32_t)motor_control_config.
+            speed_voltage_fast_limit_hold_ms * 20U;
+        if (hold_cycles > UINT16_MAX) { hold_cycles = UINT16_MAX; }
+        control_speed_voltage_fast_limit_hold_cycles =
+            (uint16_t)hold_cycles;
+        control_speed_voltage_current_limited = true;
       }
     }
     ++test_current_samples;
@@ -2321,12 +2958,224 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
       test_current_balance_abs_max = balance_abs;
     }
 
+    /* Passive VESC observer validation. It sees the voltage vector that was
+     * active during this ADC interval and reconstructed phase currents, but
+     * its selected phase is not yet allowed to drive PWM. */
+    if (motor_control_config.observer_diagnostic_enabled &&
+        current_foc_active &&
+        (control_mode == POWER_STAGE_CONTROL_SPEED) &&
+        !control_speed_current_foc && (bus_voltage_mv > 0U)) {
+      int32_t observer_current_counts[3] = {
+          centered_samples[0], centered_samples[1], centered_samples[2]};
+      if (unobservable_phase < 3U) {
+        const uint32_t other_1 = (unobservable_phase + 1U) % 3U;
+        const uint32_t other_2 = (unobservable_phase + 2U) % 3U;
+        observer_current_counts[unobservable_phase] =
+            -(observer_current_counts[other_1] +
+              observer_current_counts[other_2]);
+      }
+      const float current_alpha =
+          (float)observer_current_counts[0] * CURRENT_ADC_TO_AMPS;
+      const float current_beta =
+          ((float)observer_current_counts[0] +
+           2.0F * (float)observer_current_counts[1]) *
+          CURRENT_ADC_TO_AMPS * 0.57735026919F;
+      const float inverse_arr = 1.0F / (float)TIM1->ARR;
+      const float bus_voltage = (float)bus_voltage_mv * 0.001F;
+      const float duty_a = (float)TIM1->CCR1 * inverse_arr;
+      const float duty_b = (float)TIM1->CCR2 * inverse_arr;
+      const float duty_c = (float)TIM1->CCR3 * inverse_arr;
+      const float voltage_alpha = bus_voltage *
+          (2.0F * duty_a - duty_b - duty_c) / 3.0F;
+      const float voltage_beta = bus_voltage *
+          (duty_b - duty_c) * 0.57735026919F;
+      float duty_abs = sqrtf(voltage_alpha * voltage_alpha +
+                             voltage_beta * voltage_beta) /
+          (0.66666666667F * bus_voltage);
+      if (duty_abs > 1.0F) { duty_abs = 1.0F; }
+      foc_observer_update(&speed_observer, voltage_alpha, voltage_beta,
+                          current_alpha, current_beta, duty_abs,
+                          CURRENT_FOC_DT_SECONDS);
+      foc_observer_run_pll(&speed_observer, CURRENT_FOC_DT_SECONDS);
+      uint16_t encoder_electrical_raw;
+      if (angle_sensor_get_electrical_raw_fast(&encoder_electrical_raw)) {
+        const float encoder_phase_rad =
+            (float)encoder_electrical_raw *
+            (6.28318530718F / 4096.0F);
+        (void)foc_observer_select_phase(&speed_observer,
+                                       encoder_phase_rad);
+        speed_observer_phase_raw = (uint16_t)(
+            (speed_observer.phase_rad < 0.0F ?
+             speed_observer.phase_rad + 6.28318530718F :
+             speed_observer.phase_rad) *
+            (4096.0F / 6.28318530718F)) & 0x0FFFU;
+        int32_t observer_error =
+            (int32_t)speed_observer_phase_raw -
+            (int32_t)encoder_electrical_raw;
+        if (observer_error > 2047) { observer_error -= 4096; }
+        else if (observer_error < -2048) { observer_error += 4096; }
+        speed_observer_encoder_error_raw = (int16_t)observer_error;
+        speed_observer_erpm = (int32_t)(
+            speed_observer.pll_speed_rad_per_second *
+            (60.0F / 6.28318530718F));
+        speed_observer_using_encoder = speed_observer.using_encoder;
+      }
+    }
+
+    const bool direct_voltage_control = current_foc_active &&
+        ((((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+           (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) &&
+          !control_speed_current_foc) ||
+         (control_mode == POWER_STAGE_CONTROL_POSITION));
+    const bool current_foc_required = current_foc_active &&
+        (control_mode != POWER_STAGE_CONTROL_DISABLED) &&
+        !direct_voltage_control;
+    /* Direct voltage speed control does not otherwise enter the d/q current
+     * transform block below. Update its predicted electrical angle and PWM
+     * independently on every ADC cycle, using the latest lock-free encoder
+     * snapshot and the filtered mechanical PLL speed. */
+    if (direct_voltage_control &&
+        ((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+         (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE))) {
+      uint16_t measured_electrical_raw;
+      uint32_t electrical_timestamp_ms;
+      uint32_t electrical_timestamp_cycles;
+      uint32_t electrical_sequence;
+      if (angle_sensor_get_electrical_sample_precise(
+              &measured_electrical_raw, &electrical_timestamp_ms,
+              &electrical_timestamp_cycles, &electrical_sequence)) {
+        uint16_t commanded_electrical_raw = measured_electrical_raw;
+        if (motor_control_config.high_speed_pll_prediction_enabled) {
+          uint32_t sample_age_ms =
+              (uint32_t)(HAL_GetTick() - electrical_timestamp_ms);
+          if (sample_age_ms > 10U) { sample_age_ms = 10U; }
+          const float prediction_seconds =
+              (float)sample_age_ms * 0.001F +
+              motor_control_config.encoder_phase_advance_seconds;
+          const int32_t advance_raw = (int32_t)lroundf(
+              (float)control_speed_actual_mdps * 0.001F *
+              CONTROL_MOTOR_POLE_PAIRS * prediction_seconds *
+              (4096.0F / 360.0F));
+          commanded_electrical_raw =
+              (uint16_t)((int32_t)measured_electrical_raw + advance_raw) &
+              0x0FFFU;
+        }
+        control_pll_predicted_electrical_raw = commanded_electrical_raw;
+
+        /* Hardware-timestamped continuous encoder PLL. DWT removes the 1 ms
+         * quantization that caused the first interpolation experiment to
+         * lose phase at high speed. Its PWM contribution is blended below. */
+        const uint32_t now_cycles = DWT->CYCCNT;
+        const float raw_per_second =
+            (float)control_speed_actual_mdps * 0.001F *
+            CONTROL_MOTOR_POLE_PAIRS * (4096.0F / 360.0F);
+        const float elapsed_seconds = precise_encoder_initialized ?
+            (float)(uint32_t)(now_cycles - precise_encoder_last_cycles) /
+                (float)SystemCoreClock : 0.0F;
+        if (!precise_encoder_initialized || elapsed_seconds > 0.01F) {
+          precise_encoder_phase_raw = (float)measured_electrical_raw;
+          precise_encoder_sensor_sequence = electrical_sequence;
+          precise_encoder_initialized = true;
+        } else {
+          precise_encoder_phase_raw += raw_per_second * elapsed_seconds;
+          while (precise_encoder_phase_raw >= 4096.0F) {
+            precise_encoder_phase_raw -= 4096.0F;
+          }
+          while (precise_encoder_phase_raw < 0.0F) {
+            precise_encoder_phase_raw += 4096.0F;
+          }
+          if (electrical_sequence != precise_encoder_sensor_sequence) {
+            const float sample_age_seconds =
+                (float)(uint32_t)(now_cycles - electrical_timestamp_cycles) /
+                    (float)SystemCoreClock +
+                motor_control_config.encoder_phase_advance_seconds;
+            float measured_now_raw = (float)measured_electrical_raw +
+                raw_per_second * sample_age_seconds;
+            while (measured_now_raw >= 4096.0F) {
+              measured_now_raw -= 4096.0F;
+            }
+            while (measured_now_raw < 0.0F) {
+              measured_now_raw += 4096.0F;
+            }
+            float phase_error = measured_now_raw -
+                precise_encoder_phase_raw;
+            if (phase_error > 2048.0F) { phase_error -= 4096.0F; }
+            else if (phase_error < -2048.0F) { phase_error += 4096.0F; }
+            speed_observer_encoder_error_raw =
+                (int16_t)lroundf(phase_error);
+            if (fabsf(phase_error) <= (float)motor_control_config.
+                    encoder_precise_max_error_raw) {
+              float phase_correction = phase_error *
+                  motor_control_config.encoder_precise_phase_correction_gain;
+              const float max_correction = motor_control_config.
+                  encoder_precise_max_correction_raw;
+              if (phase_correction > max_correction) {
+                phase_correction = max_correction;
+              } else if (phase_correction < -max_correction) {
+                phase_correction = -max_correction;
+              }
+              precise_encoder_phase_raw += phase_correction;
+            }
+            precise_encoder_sensor_sequence = electrical_sequence;
+          }
+        }
+        precise_encoder_last_cycles = now_cycles;
+        speed_observer_phase_raw =
+            (uint16_t)lroundf(precise_encoder_phase_raw) & 0x0FFFU;
+        speed_observer_erpm = (int32_t)(
+            (float)control_speed_actual_mdps * 0.001F *
+            CONTROL_MOTOR_POLE_PAIRS / 6.0F);
+
+        const int32_t actual_abs_mdps = control_speed_actual_mdps < 0 ?
+            -control_speed_actual_mdps : control_speed_actual_mdps;
+        if (!precise_encoder_requested &&
+            actual_abs_mdps >= motor_control_config.
+                encoder_precise_phase_enter_mdps &&
+            abs(speed_observer_encoder_error_raw) <= (int)motor_control_config.
+                encoder_precise_max_error_raw) {
+          precise_encoder_requested = true;
+        } else if (precise_encoder_requested &&
+                   actual_abs_mdps <= motor_control_config.
+                       encoder_precise_phase_exit_mdps) {
+          precise_encoder_requested = false;
+        }
+        const float blend_step = motor_control_config.
+            encoder_precise_phase_blend_per_second * elapsed_seconds;
+        if (precise_encoder_requested) {
+          precise_encoder_blend += blend_step;
+          if (precise_encoder_blend > 1.0F) {
+            precise_encoder_blend = 1.0F;
+          }
+        } else {
+          precise_encoder_blend -= blend_step;
+          if (precise_encoder_blend < 0.0F) {
+            precise_encoder_blend = 0.0F;
+          }
+        }
+        speed_observer_using_encoder = precise_encoder_blend < 1.0F;
+        int32_t precise_delta = (int32_t)speed_observer_phase_raw -
+            (int32_t)commanded_electrical_raw;
+        if (precise_delta > 2047) { precise_delta -= 4096; }
+        else if (precise_delta < -2048) { precise_delta += 4096; }
+        const uint16_t blended_electrical_raw = (uint16_t)(
+            (int32_t)commanded_electrical_raw +
+            (int32_t)lroundf((float)precise_delta *
+                             precise_encoder_blend)) & 0x0FFFU;
+        const foc_pwm_output_t direct_pwm = foc_oriented_voltage_to_pwm(
+            blended_electrical_raw, control_speed_voltage_q_counts,
+            (uint16_t)TIM1->ARR);
+        set_compare_values(direct_pwm.a, direct_pwm.b, direct_pwm.c);
+      }
+    }
+    /* Direct-Vq control only receives a new AS5600 sample at 500 Hz and does
+     * not consume d/q current feedback. Updating it at 1 kHz avoids spending
+     * the entire 20 kHz ADC interrupt on unused Clarke/Park diagnostics. */
     const uint8_t transform_divider_limit =
         ((((test_kind == TEST_KIND_CURRENT_FOC) ||
            (test_kind == TEST_KIND_ENCODER_ALIGNMENT) ||
-           (test_kind == TEST_KIND_RESISTANCE) ||
-           (control_mode != POWER_STAGE_CONTROL_DISABLED)) &&
+           (test_kind == TEST_KIND_RESISTANCE)) &&
           current_foc_active) ||
+         current_foc_required ||
          (test_kind == TEST_KIND_FLUX) ||
          (test_kind == TEST_KIND_INDUCTANCE)) ?
         1U : CURRENT_TRANSFORM_DIAGNOSTIC_DIVIDER;
@@ -2334,9 +3183,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
           (test_rotation_started_at != 0U)) ||
          (((test_kind == TEST_KIND_CURRENT_FOC) ||
            (test_kind == TEST_KIND_ENCODER_ALIGNMENT) ||
-           (test_kind == TEST_KIND_RESISTANCE) ||
-           (control_mode != POWER_STAGE_CONTROL_DISABLED)) &&
+           (test_kind == TEST_KIND_RESISTANCE)) &&
           current_foc_active) ||
+         current_foc_required ||
          (test_kind == TEST_KIND_FLUX) ||
          (test_kind == TEST_KIND_INDUCTANCE)) &&
         (++test_transform_divider >= transform_divider_limit)) {
@@ -2473,6 +3322,8 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
       }
 
       uint16_t electrical_raw;
+      uint32_t electrical_timestamp_ms = 0U;
+      uint32_t electrical_sequence = 0U;
       const bool fixed_identification_angle =
           (test_kind == TEST_KIND_ENCODER_ALIGNMENT) ||
           (test_kind == TEST_KIND_RESISTANCE) ||
@@ -2480,42 +3331,104 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
       const bool angle_valid = fixed_identification_angle ?
           ((electrical_raw = test_kind == TEST_KIND_ENCODER_ALIGNMENT ?
                test_command_electrical_raw : 0U), true) :
-          angle_sensor_get_electrical_raw_fast(&electrical_raw);
+          angle_sensor_get_electrical_sample_fast(&electrical_raw,
+                                                   &electrical_timestamp_ms,
+                                                   &electrical_sequence);
       if (angle_valid) {
-        if ((control_mode == POWER_STAGE_CONTROL_SPEED) ||
-            (control_mode == POWER_STAGE_CONTROL_POSITION) ||
-            (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE) ||
-            (control_mode == POWER_STAGE_CONTROL_HAPTIC)) {
+        uint16_t control_electrical_raw = electrical_raw;
+        if (((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+             (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) &&
+            !control_speed_current_foc &&
+            motor_control_config.high_speed_pll_prediction_enabled) {
+          uint32_t sample_age_ms =
+              (uint32_t)(HAL_GetTick() - electrical_timestamp_ms);
+          if (sample_age_ms > 10U) { sample_age_ms = 10U; }
+          const float prediction_seconds =
+              (float)sample_age_ms * 0.001F +
+              motor_control_config.encoder_phase_advance_seconds;
+          const float mechanical_speed_dps =
+              (float)control_speed_actual_mdps * 0.001F;
+          const int32_t advance_raw = (int32_t)lroundf(
+              mechanical_speed_dps * CONTROL_MOTOR_POLE_PAIRS *
+              prediction_seconds * (4096.0F / 360.0F));
+          control_pll_predicted_electrical_raw =
+              (uint16_t)((int32_t)electrical_raw + advance_raw) & 0x0FFFU;
+          control_electrical_raw = control_pll_predicted_electrical_raw;
+        }
+        if (((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+             (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) &&
+            control_speed_current_foc &&
+            motor_control_config.high_speed_pll_prediction_enabled) {
           const float measured_phase_rad = (float)electrical_raw *
               (6.28318530718F / 4096.0F);
           if (!control_pll_initialized) {
             control_pll_phase_rad = measured_phase_rad;
             control_pll_speed_electrical_rad_per_second = 0.0F;
+            control_pll_sensor_sequence = electrical_sequence;
+            control_pll_sensor_timestamp_ms = electrical_timestamp_ms;
             control_pll_initialized = true;
           } else {
-            float delta_theta = measured_phase_rad - control_pll_phase_rad;
-            if (delta_theta > 3.14159265359F) {
-              delta_theta -= 6.28318530718F;
-            } else if (delta_theta < -3.14159265359F) {
-              delta_theta += 6.28318530718F;
-            }
             control_pll_phase_rad +=
-                (control_pll_speed_electrical_rad_per_second +
-                 CONTROL_FOC_PLL_KP * delta_theta) *
+                control_pll_speed_electrical_rad_per_second *
                 CURRENT_FOC_DT_SECONDS;
             if (control_pll_phase_rad >= 6.28318530718F) {
               control_pll_phase_rad -= 6.28318530718F;
             } else if (control_pll_phase_rad < 0.0F) {
               control_pll_phase_rad += 6.28318530718F;
             }
-            control_pll_speed_electrical_rad_per_second +=
-                CONTROL_FOC_PLL_KI * delta_theta *
-                CURRENT_FOC_DT_SECONDS;
+            if (electrical_sequence != control_pll_sensor_sequence) {
+              float delta_theta = measured_phase_rad - control_pll_phase_rad;
+              if (delta_theta > 3.14159265359F) {
+                delta_theta -= 6.28318530718F;
+              } else if (delta_theta < -3.14159265359F) {
+                delta_theta += 6.28318530718F;
+              }
+              uint32_t sample_elapsed_ms = electrical_timestamp_ms -
+                  control_pll_sensor_timestamp_ms;
+              if (sample_elapsed_ms < 1U) { sample_elapsed_ms = 1U; }
+              if (sample_elapsed_ms > 10U) { sample_elapsed_ms = 10U; }
+              const float sample_dt = (float)sample_elapsed_ms * 0.001F;
+              control_pll_phase_rad +=
+                  CONTROL_FOC_PLL_KP * delta_theta * sample_dt;
+              if (control_pll_phase_rad >= 6.28318530718F) {
+                control_pll_phase_rad -= 6.28318530718F;
+              } else if (control_pll_phase_rad < 0.0F) {
+                control_pll_phase_rad += 6.28318530718F;
+              }
+              control_pll_speed_electrical_rad_per_second +=
+                  CONTROL_FOC_PLL_KI * delta_theta * sample_dt;
+              control_pll_sensor_sequence = electrical_sequence;
+              control_pll_sensor_timestamp_ms = electrical_timestamp_ms;
+            }
           }
-          control_speed_actual_mdps = (int32_t)(
+          float predicted_phase_rad = control_pll_phase_rad +
               control_pll_speed_electrical_rad_per_second *
-              (180000.0F / 3.14159265359F) /
-              CONTROL_MOTOR_POLE_PAIRS);
+              motor_control_config.encoder_phase_advance_seconds;
+          while (predicted_phase_rad >= 6.28318530718F) {
+            predicted_phase_rad -= 6.28318530718F;
+          }
+          while (predicted_phase_rad < 0.0F) {
+            predicted_phase_rad += 6.28318530718F;
+          }
+          control_pll_predicted_electrical_raw = (uint16_t)(
+              predicted_phase_rad * (4096.0F / 6.28318530718F)) & 0x0FFFU;
+          if (((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+               (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) &&
+              control_speed_current_foc &&
+              motor_control_config.high_speed_pll_prediction_enabled) {
+            control_electrical_raw = control_pll_predicted_electrical_raw;
+          }
+          /* Keep the slow mechanical position PLL as the sole speed source
+           * unless high-speed electrical prediction is explicitly enabled.
+           * Otherwise this ISR-side estimate overwrites the filtered value
+           * consumed by the speed PI, even while prediction is disabled. */
+          if (control_speed_current_foc &&
+              motor_control_config.high_speed_pll_prediction_enabled) {
+            control_speed_actual_mdps = (int32_t)(
+                control_pll_speed_electrical_rad_per_second *
+                (180000.0F / 3.14159265359F) /
+                CONTROL_MOTOR_POLE_PAIRS);
+          }
         }
         const bool stationary_identification =
             (test_kind == TEST_KIND_RESISTANCE) ||
@@ -2534,7 +3447,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         const float ic = (float)transform_samples[2] * current_scale;
         /* FOC owns Clarke/Park math; PowerStage owns ADC sample selection. */
         const foc_dq_sample_t dq = foc_clarke_park(
-            ia, ib, ic, full_clarke_currents, electrical_raw);
+            ia, ib, ic, full_clarke_currents, control_electrical_raw);
         const float id = dq.d;
         const float iq = dq.q;
         const int32_t id_ma = (int32_t)(1000.0F * id);
@@ -2619,13 +3532,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
           }
         }
 
-        if (((control_mode == POWER_STAGE_CONTROL_SPEED) ||
+        if ((((control_mode == POWER_STAGE_CONTROL_SPEED) &&
+              !control_speed_current_foc) ||
              (control_mode == POWER_STAGE_CONTROL_POSITION) ||
              (control_mode == POWER_STAGE_CONTROL_POSITION_PROFILE)) &&
             current_foc_active) {
           const int32_t voltage_q_counts = control_speed_voltage_q_counts;
           const foc_pwm_output_t pwm = foc_oriented_voltage_to_pwm(
-              electrical_raw, voltage_q_counts, (uint16_t)TIM1->ARR);
+              control_electrical_raw, voltage_q_counts, (uint16_t)TIM1->ARR);
           set_compare_values(pwm.a, pwm.b, pwm.c);
         } else if ((((test_kind == TEST_KIND_CURRENT_FOC) ||
               (test_kind == TEST_KIND_ENCODER_ALIGNMENT) ||
@@ -2646,7 +3560,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
               (float)(TIM1->ARR /
                   (test_kind == TEST_KIND_RESISTANCE ?
                        RESISTANCE_MODULATION_DIVISOR :
-                       CURRENT_FOC_MODULATION_DIVISOR));
+                       (control_speed_current_foc ?
+                            HIGH_SPEED_MODULATION_DIVISOR :
+                            CURRENT_FOC_MODULATION_DIVISOR)));
 
           const float current_ki = test_kind == TEST_KIND_RESISTANCE ?
               RESISTANCE_FOC_KI_COUNTS_PER_AMP_SECOND :
@@ -2660,7 +3576,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
               motor_control_config.current_kp_pwm_counts_per_amp,
               current_ki,
               motor_control_config.current_loop_period_seconds,
-              voltage_limit_counts, electrical_raw);
+              voltage_limit_counts, control_electrical_raw);
           current_foc_integral_d = controller.integral_d;
           current_foc_integral_q = controller.integral_q;
           if (voltage.integral_d_saturated) {
@@ -2706,8 +3622,13 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
             }
           }
 
-          const foc_pwm_output_t pwm = foc_voltage_to_pwm(
-              voltage.alpha, voltage.beta, (uint16_t)TIM1->ARR);
+          const foc_pwm_output_t pwm =
+              control_speed_current_foc &&
+              motor_control_config.high_speed_svm_enabled ?
+              foc_svm_voltage_to_pwm(voltage.alpha, voltage.beta,
+                                     (uint16_t)TIM1->ARR, NULL) :
+              foc_voltage_to_pwm(voltage.alpha, voltage.beta,
+                                 (uint16_t)TIM1->ARR);
           set_compare_values(pwm.a, pwm.b, pwm.c);
         }
       }
@@ -2726,6 +3647,17 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 void HAL_GPIO_EXTI_Callback(uint16_t gpio_pin)
 {
   if (gpio_pin != DRV_FAULT_N_Pin) {
+    return;
+  }
+
+  /*
+   * DRV8301 keeps nFAULT low briefly while EN_GATE wakes its internal
+   * supplies and charge pump.  power_stage_enable() deliberately waits for
+   * that interval and checks the pin before entering RUNNING.  Ignore the
+   * corresponding falling edge here; once running, nFAULT is an immediate
+   * shutdown request.
+   */
+  if (stage_state != POWER_STAGE_RUNNING) {
     return;
   }
 

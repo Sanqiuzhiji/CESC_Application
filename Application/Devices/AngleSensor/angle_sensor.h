@@ -26,10 +26,9 @@ typedef struct {
   float electrical_degrees;
   bool electrical_zero_calibrated;
   uint32_t timestamp_ms;
+  uint32_t timestamp_cpu_cycles;
   angle_sensor_status_t status;
 } angle_sensor_sample_t;
-
-enum { ANGLE_SENSOR_MOTOR_POLE_PAIRS = 11U };
 
 /** Initialize the configured angle sensor backend. */
 bool angle_sensor_init(void);
@@ -49,6 +48,17 @@ bool angle_sensor_calibrate_electrical_zero(uint16_t target_electrical_raw);
 
 /** Lock-free cached electrical angle read suitable for the ADC ISR. */
 bool angle_sensor_get_electrical_raw_fast(uint16_t *electrical_raw);
+
+/** Lock-free angle snapshot with sample identity for PLL prediction. */
+bool angle_sensor_get_electrical_sample_fast(uint16_t *electrical_raw,
+                                             uint32_t *timestamp_ms,
+                                             uint32_t *sequence);
+
+/** Same lock-free snapshot with the DWT cycle timestamp captured at read. */
+bool angle_sensor_get_electrical_sample_precise(uint16_t *electrical_raw,
+                                                uint32_t *timestamp_ms,
+                                                uint32_t *timestamp_cpu_cycles,
+                                                uint32_t *sequence);
 
 angle_sensor_status_t angle_sensor_get_status(void);
 

@@ -676,10 +676,16 @@ commissioning 测试，并且 AS5600 电角度零位已经校准且样本新鲜�
 ### 11.6 `SET_SPEED`（`0x0A`）
 
 请求 Payload 为小端 `int32 speedTargetMillidegreesPerSecond`。第一版正式有感
-速度模式采用 VESC 相同的级联结构：编码器 PLL 速度反馈经过速度 PI 产生 `Iq`
-目标，再由正式电流环执行。当前范围限制为 `-45000..+45000 millidegree/s`
-（±45 degree/s），速度模式 `Iq` 限制为 ±300 mA，加速度限制为 45 degree/s²，并使用
-±50 mA方向性起动转矩前馈克服低速齿槽。
+速度模式采用分段有感控制。当前范围限制为
+`-3000000..+3000000 millidegree/s`（±500 RPM），默认加速度限制为
+600 degree/s²。低速直接电压段单独限制为 20 degree/s²，避免给电压路径施加
+中高速所需的激进斜坡。低于 20 RPM 使用编码器位置轨迹误差直接产生受限 `Vq`；达到
+20 RPM 后切换到 VESC 式电气 RPM 速度 PI，PI 输出经过 1 A/s 斜坡后成为
+`Iq` 目标，再由电流 PI 和六扇区 SVPWM 执行。编码器 PLL 只在新 AS5600 样本
+到达时校正。AS5600 以 500 Hz 读取，并在 20 kHz 电流环中预测电角度。速度降至
+15 RPM 以下时切回
+低速路径，形成迟滞以防止反复切换。中高速路径使用 ±50 mA 方向性前馈克服
+起动齿槽。
 绝对目标小于 50 millidegree/s 时释放电机。非零命令的准入条件和 500 ms
 看门狗与 `SET_IQ_CURRENT` 相同。
 
@@ -698,7 +704,7 @@ VESC式结构：位置P环直接生成 `Iq` 目标，再由电流PI执行。当�
 `positionTargetMillidegrees`、正数速度上限 `maximumSpeedMillidegreesPerSecond`、
 加速度 `accelerationMillidegreesPerSecondSquared` 和减速度
 `decelerationMillidegreesPerSecondSquared`。位置范围为 ±3600000 millidegree（±10圈），
-速度范围为 50..45000 millidegree/s，加减速度范围均为 100..90000
+速度范围为 50..90000 millidegree/s，加减速度范围均为 100..90000
 millidegree/s²。固件生成带加速和提前减速的梯形/三角形位置轨迹，再由编码器位置误差
 直接产生受限 `Vq` 电压矢量，因此能够按指定速度转到指定圈数或角度。
 

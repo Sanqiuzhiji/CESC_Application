@@ -99,6 +99,7 @@ int main(void)
   MX_ADC3_Init();
   MX_SPI3_Init();
   MX_TIM1_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
   application_init();
 

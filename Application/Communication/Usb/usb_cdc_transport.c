@@ -14,6 +14,8 @@ enum {
 extern osMutexId_t usbTxMutexHandle;
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
+static volatile usb_cdc_transport_diagnostics_t transport_diagnostics;
+
 static bool wait_for_tx_idle(uint32_t timeout_ms)
 {
     const uint32_t started_at = osKernelGetTickCount();
@@ -38,11 +40,16 @@ static bool wait_for_tx_idle(uint32_t timeout_ms)
 bool usb_cdc_transport_send(uint8_t *data, uint16_t length)
 {
     bool succeeded = false;
+    bool submitted = false;
     const uint32_t started_at = osKernelGetTickCount();
 
-    if ((data == NULL) || (length == 0U) ||
-        (osMutexAcquire(usbTxMutexHandle, USB_TX_MUTEX_TIMEOUT_MS) != osOK))
+    if ((data == NULL) || (length == 0U))
     {
+        return false;
+    }
+    if (osMutexAcquire(usbTxMutexHandle, USB_TX_MUTEX_TIMEOUT_MS) != osOK)
+    {
+        ++transport_diagnostics.mutex_timeouts;
         return false;
     }
 
@@ -56,12 +63,45 @@ bool usb_cdc_transport_send(uint8_t *data, uint16_t length)
         if (wait_for_tx_idle(remaining) &&
             (CDC_Transmit_FS(data, length) == USBD_OK))
         {
+            submitted = true;
             succeeded = wait_for_tx_idle(USB_TX_COMPLETE_TIMEOUT_MS);
             break;
         }
         (void)osDelay(1U);
     }
 
+    if (!submitted) ++transport_diagnostics.submit_timeouts;
+    else if (!succeeded) ++transport_diagnostics.completion_timeouts;
+
     (void)osMutexRelease(usbTxMutexHandle);
     return succeeded;
+}
+
+bool usb_cdc_transport_try_send(uint8_t *data, uint16_t length)
+{
+    bool submitted = false;
+
+    if ((data == NULL) || (length == 0U) ||
+        (osMutexAcquire(usbTxMutexHandle, 0U) != osOK))
+    {
+        ++transport_diagnostics.nonblocking_drops;
+        return false;
+    }
+
+    const USBD_CDC_HandleTypeDef *cdc =
+        (const USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+    if ((cdc != NULL) && (cdc->TxState == 0U))
+    {
+        submitted = CDC_Transmit_FS(data, length) == USBD_OK;
+    }
+
+    (void)osMutexRelease(usbTxMutexHandle);
+    if (!submitted) ++transport_diagnostics.nonblocking_drops;
+    return submitted;
+}
+
+void usb_cdc_transport_get_diagnostics(
+    usb_cdc_transport_diagnostics_t *diagnostics)
+{
+    if (diagnostics != NULL) *diagnostics = transport_diagnostics;
 }

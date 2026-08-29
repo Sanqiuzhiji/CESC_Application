@@ -6,6 +6,7 @@
 #include "cmsis_os2.h"
 #include "i2c.h"
 #include "main.h"
+#include "motor_control_config.h"
 
 enum
 {
@@ -103,6 +104,21 @@ static bool i2c_read(void* context, uint8_t address, uint8_t reg,
     return result == HAL_OK;
 }
 
+static bool i2c_write(void* context, uint8_t address, uint8_t reg,
+                      const uint8_t* data, uint16_t length)
+{
+    I2C_HandleTypeDef* i2c = (I2C_HandleTypeDef*)context;
+    const HAL_StatusTypeDef result =
+        HAL_I2C_Mem_Write(i2c, (uint16_t)address << 1, reg,
+                          I2C_MEMADD_SIZE_8BIT, (uint8_t*)data, length,
+                          ANGLE_SENSOR_I2C_TIMEOUT_MS);
+    if (result != HAL_OK)
+    {
+        recover_i2c_bus(i2c);
+    }
+    return result == HAL_OK;
+}
+
 static angle_sensor_status_t map_magnet_status(as5600_magnet_status_t status)
 {
     switch (status)
@@ -120,9 +136,14 @@ bool angle_sensor_init(void)
     const as5600_bus_t bus = {
         .context = &hi2c2,
         .ready = i2c_ready,
-        .read = i2c_read
+        .read = i2c_read,
+        .write = i2c_write
     };
     const uint32_t now = HAL_GetTick();
+
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
     latest_sample.status = ANGLE_SENSOR_STATUS_UNINITIALIZED;
     sample_valid = false;
@@ -138,6 +159,11 @@ bool angle_sensor_init(void)
     if (!as5600_init(&sensor, &bus))
     {
         latest_sample.status = ANGLE_SENSOR_STATUS_NOT_FOUND;
+        return false;
+    }
+    if (!as5600_set_fast_filter(&sensor))
+    {
+        latest_sample.status = ANGLE_SENSOR_STATUS_IO_ERROR;
         return false;
     }
 
@@ -194,7 +220,7 @@ void angle_sensor_process(void)
     latest_sample.position_degrees =
         (float)position_counts * (360.0F / 4096.0F);
     latest_sample.electrical_raw_unaligned = (uint16_t)(
-        ((uint32_t)raw * ANGLE_SENSOR_MOTOR_POLE_PAIRS) & 0x0FFFU);
+        ((uint32_t)raw * motor_control_config.pole_pairs) & 0x0FFFU);
     latest_sample.electrical_degrees_unaligned =
         (float)latest_sample.electrical_raw_unaligned * (360.0F / 4096.0F);
     latest_sample.electrical_zero_raw = electrical_zero_raw;
@@ -205,6 +231,7 @@ void angle_sensor_process(void)
     latest_sample.electrical_zero_calibrated = electrical_zero_calibrated;
     electrical_raw_fast = latest_sample.electrical_raw;
     latest_sample.timestamp_ms = now;
+    latest_sample.timestamp_cpu_cycles = DWT->CYCCNT;
     sample_valid = true;
 
     if ((uint32_t)(now - last_diagnostic_ms) >=
@@ -220,32 +247,30 @@ void angle_sensor_process(void)
 
 bool angle_sensor_get_sample(angle_sensor_sample_t* sample)
 {
+    uint32_t sequence_before;
+    uint32_t sequence_after;
+
     if ((sample == NULL) || !sample_valid)
     {
         return false;
     }
-    uint32_t sequence_before;
-    uint32_t sequence_after;
 
-    for (;;)
+    /* protocolTask has higher priority than sensorTask. If it preempts the
+     * publisher while the sequence is odd, spinning here would prevent the
+     * writer from ever resuming. Treat a contested snapshot as transient and
+     * let the caller retry on the next request. */
+    sequence_before = sample_sequence;
+    if ((sequence_before & 1U) != 0U)
     {
-        sequence_before = sample_sequence;
-        if ((sequence_before & 1U) != 0U)
-        {
-            continue;
-        }
-        __DMB();
-        *sample = latest_sample;
-        __DMB();
-        sequence_after = sample_sequence;
-        if ((sequence_before == sequence_after) &&
-            ((sequence_after & 1U) == 0U))
-        {
-            break;
-        }
+        return false;
     }
+    __DMB();
+    *sample = latest_sample;
+    __DMB();
+    sequence_after = sample_sequence;
 
-    return sample_valid;
+    return (sequence_before == sequence_after) &&
+           ((sequence_after & 1U) == 0U) && sample_valid;
 }
 
 bool angle_sensor_read_degrees(float* degrees)
@@ -298,6 +323,74 @@ bool angle_sensor_get_electrical_raw_fast(uint16_t *electrical_raw)
         return false;
     }
     *electrical_raw = electrical_raw_fast;
+    return true;
+}
+
+bool angle_sensor_get_electrical_sample_fast(uint16_t *electrical_raw,
+                                             uint32_t *timestamp_ms,
+                                             uint32_t *sequence)
+{
+    uint32_t sequence_before;
+    uint32_t sequence_after;
+    if ((electrical_raw == NULL) || (timestamp_ms == NULL) ||
+        (sequence == NULL) || !electrical_zero_calibrated || !sample_valid)
+    {
+        return false;
+    }
+    /* This function is called from the 20 kHz ADC ISR. Never spin on the
+     * seqlock: the ISR can preempt the sensor task while its sequence is odd,
+     * and waiting here would prevent the writer from ever completing. A
+     * missed snapshot is harmless; the control loop reuses the prior PWM for
+     * one period and retries on the next interrupt. */
+    sequence_before = sample_sequence;
+    if ((sequence_before & 1U) != 0U)
+    {
+        return false;
+    }
+    __DMB();
+    *electrical_raw = electrical_raw_fast;
+    *timestamp_ms = latest_sample.timestamp_ms;
+    __DMB();
+    sequence_after = sample_sequence;
+    if ((sequence_before != sequence_after) ||
+        ((sequence_after & 1U) != 0U))
+    {
+        return false;
+    }
+    *sequence = sequence_after;
+    return true;
+}
+
+bool angle_sensor_get_electrical_sample_precise(uint16_t *electrical_raw,
+                                                uint32_t *timestamp_ms,
+                                                uint32_t *timestamp_cpu_cycles,
+                                                uint32_t *sequence)
+{
+    uint32_t sequence_before;
+    uint32_t sequence_after;
+    if ((electrical_raw == NULL) || (timestamp_ms == NULL) ||
+        (timestamp_cpu_cycles == NULL) || (sequence == NULL) ||
+        !electrical_zero_calibrated || !sample_valid)
+    {
+        return false;
+    }
+    sequence_before = sample_sequence;
+    if ((sequence_before & 1U) != 0U)
+    {
+        return false;
+    }
+    __DMB();
+    *electrical_raw = electrical_raw_fast;
+    *timestamp_ms = latest_sample.timestamp_ms;
+    *timestamp_cpu_cycles = latest_sample.timestamp_cpu_cycles;
+    __DMB();
+    sequence_after = sample_sequence;
+    if ((sequence_before != sequence_after) ||
+        ((sequence_after & 1U) != 0U))
+    {
+        return false;
+    }
+    *sequence = sequence_after;
     return true;
 }
 

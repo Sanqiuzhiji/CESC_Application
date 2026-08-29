@@ -27,11 +27,23 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdbool.h>
+#include <stdint.h>
 
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+typedef struct {
+  uint32_t magic;
+  uint32_t exception_type;
+  uint32_t cfsr;
+  uint32_t hfsr;
+  uint32_t mmfar;
+  uint32_t bfar;
+  uint32_t pc;
+  uint32_t lr;
+} cpu_fault_record_t;
 
 /* USER CODE END ET */
 
@@ -53,9 +65,12 @@ void BusFault_Handler(void);
 void UsageFault_Handler(void);
 void DebugMon_Handler(void);
 void ADC_IRQHandler(void);
+void EXTI9_5_IRQHandler(void);
 void TIM6_DAC_IRQHandler(void);
 void OTG_FS_IRQHandler(void);
 /* USER CODE BEGIN EFP */
+bool cpu_fault_record_get(cpu_fault_record_t *record);
+void cpu_fault_record_clear(void);
 
 /* USER CODE END EFP */
 

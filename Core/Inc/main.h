@@ -73,6 +73,7 @@ void Error_Handler(void);
 #define DRV_EN_GATE_GPIO_Port GPIOB
 #define DRV_FAULT_N_Pin GPIO_PIN_7
 #define DRV_FAULT_N_GPIO_Port GPIOB
+#define DRV_FAULT_N_EXTI_IRQn EXTI9_5_IRQn
 
 /* USER CODE BEGIN Private defines */
 

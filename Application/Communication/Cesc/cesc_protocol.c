@@ -9,6 +9,7 @@
 #include "main.h"
 #include "motor_control_config.h"
 #include "power_stage.h"
+#include "stm32f4xx_it.h"
 #include "usb_cdc_transport.h"
 #include "cesc_crc.h"
 
@@ -61,6 +62,7 @@ enum {
     MOTOR_SET_POSITION_PROFILE = 0x0C,
     MOTOR_SET_HAPTIC = 0x0D,
     MOTOR_SET_TORQUE = 0x0E,
+    MOTOR_GET_CONTROL_STATUS = 0x0F,
     TELEMETRY_ENUM_CHANNELS = 0x00,
     TELEMETRY_SUBSCRIBE = 0x01,
     TELEMETRY_UNSUBSCRIBE = 0x02,
@@ -251,6 +253,43 @@ static bool transmit_frame(uint8_t *frame, uint16_t capacity,
     return false;
 }
 
+static bool transmit_stream_frame_nonblocking(
+    uint8_t message_type, uint8_t service, uint8_t command,
+    uint16_t sequence, const uint8_t *payload, uint16_t payload_length)
+{
+    const uint16_t frame_length =
+        (uint16_t)(HEADER_SIZE + payload_length + CRC_SIZE);
+    if ((payload_length > MAX_PAYLOAD) ||
+        (frame_length > sizeof(stream_frame)))
+    {
+        ++stats.transmit_overflows;
+        return false;
+    }
+
+    stream_frame[0] = MAGIC_0;
+    stream_frame[1] = MAGIC_1;
+    stream_frame[2] = PROTOCOL_VERSION;
+    stream_frame[3] = message_type;
+    stream_frame[4] = service;
+    stream_frame[5] = command;
+    write_u16(&stream_frame[6], sequence);
+    write_u16(&stream_frame[8], payload_length);
+    if (payload_length > 0U)
+    {
+        memcpy(&stream_frame[HEADER_SIZE], payload, payload_length);
+    }
+    write_u16(&stream_frame[HEADER_SIZE + payload_length],
+              cesc_crc16(&stream_frame[2],
+                         (uint32_t)(8U + payload_length)));
+    if (!usb_cdc_transport_try_send(stream_frame, frame_length))
+    {
+        ++stats.transmit_overflows;
+        return false;
+    }
+    stats.transmitted_bytes += frame_length;
+    return true;
+}
+
 static void send_response(uint8_t service, uint8_t command, uint16_t sequence,
                           uint16_t status, uint16_t data_length)
 {
@@ -337,6 +376,14 @@ static void system_service(uint8_t command, uint16_t sequence,
         write_u32(&response_buffer[index], stats.receive_overflows); index += 4U;
         write_u32(&response_buffer[index], stats.transmit_overflows); index += 4U;
         write_u32(&response_buffer[index], stats.unsupported_requests); index += 4U;
+        {
+        usb_cdc_transport_diagnostics_t usb_diagnostics;
+        usb_cdc_transport_get_diagnostics(&usb_diagnostics);
+        write_u32(&response_buffer[index], usb_diagnostics.mutex_timeouts); index += 4U;
+        write_u32(&response_buffer[index], usb_diagnostics.submit_timeouts); index += 4U;
+        write_u32(&response_buffer[index], usb_diagnostics.completion_timeouts); index += 4U;
+        write_u32(&response_buffer[index], usb_diagnostics.nonblocking_drops); index += 4U;
+        }
         send_response(SERVICE_SYSTEM, command, sequence, STATUS_OK,
                       (uint16_t)(index - 2U));
         break;
@@ -525,7 +572,7 @@ static void sensor_service(uint8_t command, uint16_t sequence,
         write_float(&response_buffer[index], sample.position_degrees); index += 4U;
         write_u16(&response_buffer[index], sample.electrical_raw_unaligned); index += 2U;
         write_float(&response_buffer[index], sample.electrical_degrees_unaligned); index += 4U;
-        response_buffer[index++] = ANGLE_SENSOR_MOTOR_POLE_PAIRS;
+        response_buffer[index++] = motor_control_config.pole_pairs;
         response_buffer[index++] = sample.electrical_zero_calibrated ? 1U : 0U;
         write_u16(&response_buffer[index], sample.electrical_zero_raw); index += 2U;
         write_u16(&response_buffer[index], sample.electrical_raw); index += 2U;
@@ -651,6 +698,7 @@ static void motor_service(uint8_t command, uint16_t sequence,
 {
     uint16_t index = 2U;
     power_stage_diagnostics_t diagnostics;
+    cpu_fault_record_t fault_record = {0};
 
     (void)payload;
     switch (command)
@@ -747,6 +795,70 @@ static void motor_service(uint8_t command, uint16_t sequence,
         write_u32(&response_buffer[index], (uint32_t)diagnostics.control_speed_millidegrees_per_second); index += 4U;
         write_u32(&response_buffer[index], (uint32_t)diagnostics.control_position_target_millidegrees); index += 4U;
         write_u32(&response_buffer[index], (uint32_t)diagnostics.control_position_millidegrees); index += 4U;
+        response_buffer[index++] = diagnostics.control_speed_current_foc;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_speed_reference_millidegrees_per_second); index += 4U;
+        write_u16(&response_buffer[index], diagnostics.control_predicted_electrical_raw); index += 2U;
+        write_u32(&response_buffer[index], diagnostics.control_encoder_sample_age_ms); index += 4U;
+        write_u16(&response_buffer[index], (uint16_t)diagnostics.control_prediction_error_raw); index += 2U;
+        (void)cpu_fault_record_get(&fault_record);
+        write_u32(&response_buffer[index], fault_record.magic); index += 4U;
+        write_u32(&response_buffer[index], fault_record.exception_type); index += 4U;
+        write_u32(&response_buffer[index], fault_record.cfsr); index += 4U;
+        write_u32(&response_buffer[index], fault_record.hfsr); index += 4U;
+        write_u32(&response_buffer[index], fault_record.mmfar); index += 4U;
+        write_u32(&response_buffer[index], fault_record.bfar); index += 4U;
+        write_u32(&response_buffer[index], fault_record.pc); index += 4U;
+        write_u32(&response_buffer[index], fault_record.lr); index += 4U;
+        response_buffer[index++] =
+            power_stage_is_command_timeout_latched() ? 1U : 0U;
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_OK,
+                      (uint16_t)(index - 2U));
+        return;
+    case MOTOR_GET_CONTROL_STATUS:
+        if (length != 0U) { send_response(SERVICE_MOTOR, command, sequence, STATUS_INVALID_LENGTH, 0U); return; }
+        if (!power_stage_get_diagnostics(&diagnostics)) { send_response(SERVICE_MOTOR, command, sequence, STATUS_NOT_READY, 0U); return; }
+        response_buffer[index++] = (uint8_t)diagnostics.state;
+        response_buffer[index++] =
+            (diagnostics.gate_enabled ? 1U : 0U) |
+            (diagnostics.pwm_outputs_enabled ? 2U : 0U) |
+            (diagnostics.fault_pin_active ? 4U : 0U) |
+            (diagnostics.bus_voltage_valid ? 8U : 0U);
+        write_u16(&response_buffer[index], diagnostics.drv_faults); index += 2U;
+        write_u32(&response_buffer[index], diagnostics.bus_voltage_mv); index += 4U;
+        response_buffer[index++] = (uint8_t)diagnostics.control_mode;
+        response_buffer[index++] = diagnostics.control_speed_current_foc;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_speed_target_millidegrees_per_second); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_speed_reference_millidegrees_per_second); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_speed_millidegrees_per_second); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_id_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_iq_ma); index += 4U;
+        write_u32(&response_buffer[index], (uint32_t)diagnostics.control_iq_target_ma); index += 4U;
+        write_u16(&response_buffer[index], diagnostics.control_predicted_electrical_raw); index += 2U;
+        write_u32(&response_buffer[index], diagnostics.control_encoder_sample_age_ms); index += 4U;
+        write_u16(&response_buffer[index], (uint16_t)diagnostics.control_prediction_error_raw); index += 2U;
+        write_u32(&response_buffer[index], diagnostics.control_timeout_remaining_ms); index += 4U;
+        (void)cpu_fault_record_get(&fault_record);
+        write_u32(&response_buffer[index], fault_record.magic); index += 4U;
+        write_u32(&response_buffer[index], fault_record.exception_type); index += 4U;
+        write_u32(&response_buffer[index], fault_record.cfsr); index += 4U;
+        write_u32(&response_buffer[index], fault_record.hfsr); index += 4U;
+        write_u32(&response_buffer[index], fault_record.mmfar); index += 4U;
+        write_u32(&response_buffer[index], fault_record.bfar); index += 4U;
+        write_u32(&response_buffer[index], fault_record.pc); index += 4U;
+        write_u32(&response_buffer[index], fault_record.lr); index += 4U;
+        write_u32(&response_buffer[index],
+                  (uint32_t)diagnostics.control_speed_voltage_q_counts); index += 4U;
+        write_u32(&response_buffer[index],
+                  (uint32_t)diagnostics.control_speed_voltage_limit_counts); index += 4U;
+        response_buffer[index++] =
+            diagnostics.control_speed_voltage_current_limited;
+        write_u16(&response_buffer[index],
+                  diagnostics.observer_phase_raw); index += 2U;
+        write_u16(&response_buffer[index],
+                  (uint16_t)diagnostics.observer_encoder_error_raw); index += 2U;
+        write_u32(&response_buffer[index],
+                  (uint32_t)diagnostics.observer_erpm); index += 4U;
+        response_buffer[index++] = diagnostics.observer_using_encoder;
         send_response(SERVICE_MOTOR, command, sequence, STATUS_OK,
                       (uint16_t)(index - 2U));
         return;
@@ -1058,9 +1170,9 @@ void cesc_protocol_periodic(void)
         default: return;
         }
     }
-    if (transmit_frame(stream_frame, sizeof(stream_frame), MESSAGE_STREAM,
-                       SERVICE_TELEMETRY, TELEMETRY_STREAM_DATA,
-                       (uint16_t)stream.frame_sequence, payload, index))
+    if (transmit_stream_frame_nonblocking(
+            MESSAGE_STREAM, SERVICE_TELEMETRY, TELEMETRY_STREAM_DATA,
+            (uint16_t)stream.frame_sequence, payload, index))
     {
         ++stream.produced_frames;
         ++stream.produced_samples;

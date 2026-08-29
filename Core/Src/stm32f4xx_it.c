@@ -41,6 +41,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
+enum { CPU_FAULT_RECORD_MAGIC = 0x43534654U };
+static volatile cpu_fault_record_t cpu_fault_record
+    __attribute__((section(".noinit"), used));
 
 /* USER CODE END PV */
 
@@ -51,6 +54,45 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static __attribute__((used, noinline)) void cpu_fault_capture_and_reset(
+    uint32_t *stack, uint32_t type)
+{
+  /* Shut down the bridge without HAL or RTOS dependencies. */
+  TIM1->BDTR &= ~TIM_BDTR_MOE;
+  TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC1NE |
+                  TIM_CCER_CC2E | TIM_CCER_CC2NE |
+                  TIM_CCER_CC3E | TIM_CCER_CC3NE);
+  DRV_EN_GATE_GPIO_Port->BSRR = (uint32_t)DRV_EN_GATE_Pin << 16U;
+
+  cpu_fault_record.exception_type = type;
+  cpu_fault_record.cfsr = SCB->CFSR;
+  cpu_fault_record.hfsr = SCB->HFSR;
+  cpu_fault_record.mmfar = SCB->MMFAR;
+  cpu_fault_record.bfar = SCB->BFAR;
+  cpu_fault_record.pc = stack[6];
+  cpu_fault_record.lr = stack[5];
+  __DMB();
+  cpu_fault_record.magic = CPU_FAULT_RECORD_MAGIC;
+  __DSB();
+  NVIC_SystemReset();
+  for (;;) {}
+}
+
+bool cpu_fault_record_get(cpu_fault_record_t *record)
+{
+  if ((record == NULL) ||
+      (cpu_fault_record.magic != CPU_FAULT_RECORD_MAGIC)) {
+    return false;
+  }
+  *record = cpu_fault_record;
+  return true;
+}
+
+void cpu_fault_record_clear(void)
+{
+  cpu_fault_record.magic = 0U;
+  __DMB();
+}
 
 /* USER CODE END 0 */
 
@@ -177,6 +219,20 @@ void ADC_IRQHandler(void)
   /* USER CODE BEGIN ADC_IRQn 1 */
 
   /* USER CODE END ADC_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI line[9:5] interrupts.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
+
+  /* USER CODE END EXTI9_5_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(DRV_FAULT_N_Pin);
+  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
+
+  /* USER CODE END EXTI9_5_IRQn 1 */
 }
 
 /**

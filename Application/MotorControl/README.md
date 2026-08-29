@@ -41,6 +41,24 @@ be unit-tested without STM32 peripherals.
 - commissioning and motor-parameter measurement state machines;
 - dispatch between torque/current FOC and encoder-oriented voltage modes.
 
+Speed mode uses two regimes around the same FOC math:
+
+- below 20 RPM, the proven encoder-position-error to direct-q-voltage path;
+- above 20 RPM, a VESC-style electrical-RPM PI that produces an Iq target;
+- a 1 A/s Iq slew limit for a smooth handoff into the high-speed path;
+- below 15 RPM on deceleration, a hysteretic return to the low-speed path.
+
+The direct-voltage regime is limited to the proven 20 degree/s² acceleration.
+After current FOC takes over, the user speed ramp may use 600 degree/s². This
+keeps a 500 RPM command practical without applying that aggressive ramp to the
+low-speed voltage controller.
+
+The high-speed path corrects its PLL only on a new AS5600 sample, predicts
+electrical phase on every current-loop interrupt, adds configured sensor-delay
+phase advance and uses six-sector SVPWM. The AS5600 is configured for its
+fastest slow-filter setting and polled at 500 Hz; the PLL interpolates its
+phase into the 20 kHz current loop without starving USB communication.
+
 No protocol-facing configuration value should be introduced directly in this
 file. Identification-only timing constants may remain local because they are
 implementation details rather than user motor settings.

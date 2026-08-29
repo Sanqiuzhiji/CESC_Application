@@ -231,6 +231,14 @@ SECTIONS
   PROVIDE( __arm32_tls_tcb_offset = MAX(8, __tls_align) );
   PROVIDE( __arm64_tls_tcb_offset = MAX(16, __tls_align) );
 
+  /* CPU fault context must survive a software reset for post-mortem reads. */
+  .noinit (NOLOAD) : ALIGN(4)
+  {
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM
+
   .bss (NOLOAD) : ALIGN(4)
   {
     *(.bss)

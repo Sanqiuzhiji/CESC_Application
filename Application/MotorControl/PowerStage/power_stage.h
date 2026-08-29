@@ -103,6 +103,18 @@ typedef struct {
   int32_t control_speed_millidegrees_per_second;
   int32_t control_position_target_millidegrees;
   int32_t control_position_millidegrees;
+  uint8_t control_speed_current_foc;
+  int32_t control_speed_reference_millidegrees_per_second;
+  uint16_t control_predicted_electrical_raw;
+  uint32_t control_encoder_sample_age_ms;
+  int16_t control_prediction_error_raw;
+  int32_t control_speed_voltage_q_counts;
+  int32_t control_speed_voltage_limit_counts;
+  uint8_t control_speed_voltage_current_limited;
+  uint16_t observer_phase_raw;
+  int16_t observer_encoder_error_raw;
+  int32_t observer_erpm;
+  uint8_t observer_using_encoder;
 } power_stage_diagnostics_t;
 
 typedef enum {
@@ -163,6 +175,7 @@ bool power_stage_set_haptic(int32_t detent_spacing_mdeg,
                             int32_t minimum_position_mdeg,
                             int32_t maximum_position_mdeg);
 void power_stage_stop_commissioning_test(void);
+bool power_stage_is_command_timeout_latched(void);
 power_stage_test_state_t power_stage_get_test_state(void);
 uint8_t power_stage_get_test_steps_completed(void);
 

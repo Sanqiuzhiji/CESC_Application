@@ -57,6 +57,12 @@ foc_pwm_output_t foc_voltage_to_pwm(float voltage_alpha,
                                     float voltage_beta,
                                     uint16_t timer_period);
 
+/** VESC-style six-sector space-vector modulation for alpha/beta voltage. */
+foc_pwm_output_t foc_svm_voltage_to_pwm(float voltage_alpha,
+                                        float voltage_beta,
+                                        uint16_t timer_period,
+                                        uint8_t *sector);
+
 foc_pwm_output_t foc_oriented_voltage_to_pwm(uint16_t electrical_raw,
                                              int32_t voltage_q_counts,
                                              uint16_t timer_period);
