@@ -57,8 +57,9 @@ MEMORY
 {
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
 CCMRAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 64K
-/* Sectors 8-10 hold the downloaded image; sector 11 holds the bootloader. */
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 0x5FFFA
+/* Sectors 6-7 hold redundant motor configuration, sectors 8-10 hold the
+ * downloaded image and sector 11 holds the bootloader. */
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 0x3FFFA
 }
 
 /* Highest address of the user mode stack */

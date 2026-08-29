@@ -1,11 +1,14 @@
 #include "motor_control_config.h"
 
+#include <math.h>
+#include <string.h>
+
 /*
  * Default configuration for the present CESC board and motor. This is the
  * single review point for parameters that an application may later load from
  * non-volatile storage or expose through the protocol.
  */
-const motor_control_config_t motor_control_config = {
+const motor_control_config_t motor_control_default_config = {
   .pole_pairs = 11U,
   .torque_constant_nm_per_amp = 0.23F,
   .current_adc_amps_per_count = -0.08058608F,
@@ -118,3 +121,81 @@ const motor_control_config_t motor_control_config = {
   .speed_full_output_error_counts = 46.0F,
   .position_full_output_error_counts = 20.0F,
 };
+
+motor_control_config_t motor_control_config;
+
+static void extract_user(const motor_control_config_t *source,
+                         motor_user_config_t *config)
+{
+  memset(config, 0, sizeof(*config));
+  config->pole_pairs = source->pole_pairs;
+  config->torque_constant_nm_per_amp = source->torque_constant_nm_per_amp;
+  config->motor_resistance_ohm = source->motor_resistance_ohm;
+  config->motor_inductance_h = source->motor_inductance_h;
+  config->motor_flux_linkage_wb = source->motor_flux_linkage_wb;
+  config->maximum_iq_ma = source->maximum_iq_ma;
+  config->maximum_speed_mdps = source->maximum_speed_mdps;
+  config->maximum_position_mdeg = source->maximum_position_mdeg;
+  config->minimum_bus_voltage_mv = source->minimum_bus_voltage_mv;
+  config->maximum_bus_voltage_mv = source->maximum_bus_voltage_mv;
+  config->command_timeout_ms = source->command_timeout_ms;
+}
+
+void motor_control_config_get_user(motor_user_config_t *config)
+{
+  if (config != NULL) extract_user(&motor_control_config, config);
+}
+
+void motor_control_config_get_default_user(motor_user_config_t *config)
+{
+  if (config != NULL) extract_user(&motor_control_default_config, config);
+}
+
+bool motor_control_config_validate_user(const motor_user_config_t *config)
+{
+  return config != NULL && config->pole_pairs >= 1U &&
+      config->pole_pairs <= 64U &&
+      isfinite(config->torque_constant_nm_per_amp) &&
+      config->torque_constant_nm_per_amp >= 0.001F &&
+      config->torque_constant_nm_per_amp <= 10.0F &&
+      isfinite(config->motor_resistance_ohm) &&
+      config->motor_resistance_ohm >= 0.001F &&
+      config->motor_resistance_ohm <= 100.0F &&
+      isfinite(config->motor_inductance_h) &&
+      config->motor_inductance_h >= 0.000001F &&
+      config->motor_inductance_h <= 1.0F &&
+      isfinite(config->motor_flux_linkage_wb) &&
+      config->motor_flux_linkage_wb >= 0.000001F &&
+      config->motor_flux_linkage_wb <= 1.0F &&
+      config->maximum_iq_ma >= 10 && config->maximum_iq_ma <= 300 &&
+      config->maximum_speed_mdps >= 6000 &&
+      config->maximum_speed_mdps <= 3000000 &&
+      config->maximum_position_mdeg >= 360000 &&
+      config->maximum_position_mdeg <= 36000000 &&
+      config->minimum_bus_voltage_mv >= 3000U &&
+      config->minimum_bus_voltage_mv <= 12000U &&
+      config->maximum_bus_voltage_mv >= 6000U &&
+      config->maximum_bus_voltage_mv <= 15000U &&
+      config->minimum_bus_voltage_mv < config->maximum_bus_voltage_mv &&
+      config->command_timeout_ms >= 100U &&
+      config->command_timeout_ms <= 5000U;
+}
+
+bool motor_control_config_apply_user(const motor_user_config_t *config)
+{
+  if (!motor_control_config_validate_user(config)) return false;
+  motor_control_config.pole_pairs = config->pole_pairs;
+  motor_control_config.torque_constant_nm_per_amp =
+      config->torque_constant_nm_per_amp;
+  motor_control_config.motor_resistance_ohm = config->motor_resistance_ohm;
+  motor_control_config.motor_inductance_h = config->motor_inductance_h;
+  motor_control_config.motor_flux_linkage_wb = config->motor_flux_linkage_wb;
+  motor_control_config.maximum_iq_ma = config->maximum_iq_ma;
+  motor_control_config.maximum_speed_mdps = config->maximum_speed_mdps;
+  motor_control_config.maximum_profile_speed_mdps = config->maximum_speed_mdps;
+  motor_control_config.maximum_position_mdeg = config->maximum_position_mdeg;
+  motor_control_config.minimum_bus_voltage_mv = config->minimum_bus_voltage_mv;
+  motor_control_config.maximum_bus_voltage_mv = config->maximum_bus_voltage_mv;
+  motor_control_config.command_timeout_ms = config->command_timeout_ms;
+  return true;
+}

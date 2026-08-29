@@ -6,6 +6,7 @@
 #include "main.h"
 #include "cmsis_os2.h"
 #include "power_stage.h"
+#include "motor_config_store.h"
 
 extern osSemaphoreId_t usbRxSemaphoreHandle;
 
@@ -63,6 +64,7 @@ static void update_power_stage_indicator(void)
 
 void application_init(void)
 {
+  motor_config_store_init();
   (void)power_stage_init();
   cesc_protocol_init();
   heartbeat_started_at = HAL_GetTick();
@@ -77,6 +79,7 @@ void application_status_process(void)
 {
   power_stage_process();
   cesc_protocol_periodic();
+  motor_config_store_process();
   update_heartbeat();
   update_power_stage_indicator();
 }
@@ -87,6 +90,7 @@ void application_process(void)
   angle_sensor_process();
   power_stage_process();
   cesc_protocol_periodic();
+  motor_config_store_process();
   update_heartbeat();
   update_power_stage_indicator();
 }

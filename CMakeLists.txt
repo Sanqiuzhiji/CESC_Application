@@ -53,6 +53,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Application/Devices/AngleSensor/as5600.c
     Application/Devices/GateDriver/drv8301.c
     Application/MotorControl/Control/motor_control_config.c
+    Application/MotorControl/Control/motor_config_store.c
     Application/MotorControl/FOC/foc.c
     Application/MotorControl/FOC/foc_observer.c
     Application/MotorControl/PowerStage/power_stage.c

@@ -15,6 +15,9 @@ param(
     [switch]$RunResistanceTest,
     [switch]$RunInductanceTest,
     [switch]$RunFluxTest,
+    [switch]$RunConfigurationTest,
+    [switch]$ReadConfigurationOnly,
+    [switch]$RestoreAndSaveDefaults,
     [ValidateRange(-300, 300)]
     [int]$IqCurrentMa = 50,
     [ValidateRange(500, 5000)]
@@ -143,6 +146,77 @@ try {
     $port.Open()
     $port.DiscardInBuffer()
     $hello = Invoke-CescRequestWithRetry $port 0 0 1 ([byte[]]@(1,1,0,0,0,0))
+    if ($RestoreAndSaveDefaults) {
+        [void](Invoke-CescRequestWithRetry $port 4 5 2 ([byte[]]@()))
+        [void](Invoke-CescRequestWithRetry $port 4 3 3 ([byte[]]@()))
+        $defaultStatus = $null
+        [uint16]$defaultSequence = 4
+        for ($poll = 0; $poll -lt 20; ++$poll) {
+            Start-Sleep -Milliseconds 250
+            $defaultStatus = Invoke-CescRequestWithRetry $port 4 6 $defaultSequence ([byte[]]@())
+            ++$defaultSequence
+            if ($defaultStatus.Length -ge 10 -and $defaultStatus[8] -eq 0) { break }
+        }
+        $defaultConfig = Invoke-CescRequestWithRetry $port 4 1 $defaultSequence ([byte[]]@())
+        $defaultTimeout = [BitConverter]::ToUInt32([byte[]]$defaultConfig[37..40], 0)
+        if ($defaultStatus.Length -lt 10 -or $defaultStatus[0] -lt 1 -or
+            $defaultStatus[1] -ne 0 -or $defaultStatus[8] -ne 0 -or
+            $defaultStatus[9] -ne 1 -or $defaultTimeout -ne 1000) {
+            throw "Restore/save defaults failed timeout=$defaultTimeout"
+        }
+        Write-Output "PASS configuration-defaults timeoutMs=$defaultTimeout source=$($defaultStatus[0]) sequence=$([BitConverter]::ToUInt32([byte[]]$defaultStatus[4..7], 0))"
+        return
+    }
+    if ($ReadConfigurationOnly) {
+        $current = Invoke-CescRequestWithRetry $port 4 1 2 ([byte[]]@())
+        $configStatus = Invoke-CescRequestWithRetry $port 4 6 3 ([byte[]]@())
+        $timeout = [BitConverter]::ToUInt32([byte[]]$current[37..40], 0)
+        $storedSequence = [BitConverter]::ToUInt32([byte[]]$configStatus[4..7], 0)
+        Write-Output "PASS configuration-read timeoutMs=$timeout source=$($configStatus[0]) dirty=$($configStatus[1]) sequence=$storedSequence slotA=$($configStatus[2]) slotB=$($configStatus[3])"
+        return
+    }
+    if ($RunConfigurationTest) {
+        [uint16]$configSequence = 2
+        $info = Invoke-CescRequestWithRetry $port 4 0 $configSequence ([byte[]]@())
+        ++$configSequence
+        if ($info.Length -ne 8 -or [BitConverter]::ToUInt16([byte[]]$info[0..1], 0) -ne 1 -or
+            [BitConverter]::ToUInt16([byte[]]$info[2..3], 0) -ne 41) {
+            throw "Unexpected configuration info"
+        }
+        [byte[]]$before = Invoke-CescRequestWithRetry $port 4 1 $configSequence ([byte[]]@())
+        ++$configSequence
+        if ($before.Length -ne 41) { throw "Configuration payload length is not 41" }
+        [uint32]$oldTimeout = [BitConverter]::ToUInt32([byte[]]$before[37..40], 0)
+        [uint32]$newTimeout = if ($oldTimeout -eq 1100) { 1200 } else { 1100 }
+        [byte[]]$updated = [byte[]]$before.Clone()
+        [BitConverter]::GetBytes($newTimeout).CopyTo($updated, 37)
+        [void](Invoke-CescRequestWithRetry $port 4 2 $configSequence $updated)
+        ++$configSequence
+        $dirty = Invoke-CescRequestWithRetry $port 4 6 $configSequence ([byte[]]@())
+        ++$configSequence
+        if ($dirty.Length -lt 8 -or $dirty[1] -ne 1) { throw "Staged configuration is not dirty" }
+        [void](Invoke-CescRequestWithRetry $port 4 3 $configSequence ([byte[]]@()))
+        ++$configSequence
+        # A sector erase stalls flash-resident USB interrupt code briefly.
+        # Let CDC re-arm its OUT endpoint before issuing the next request.
+        $saved = $null
+        for ($poll = 0; $poll -lt 20; ++$poll) {
+            Start-Sleep -Milliseconds 250
+            $saved = Invoke-CescRequestWithRetry $port 4 6 $configSequence ([byte[]]@())
+            ++$configSequence
+            if ($saved.Length -ge 10 -and $saved[8] -eq 0) { break }
+        }
+        [byte[]]$after = Invoke-CescRequestWithRetry $port 4 1 $configSequence ([byte[]]@())
+        $readTimeout = [BitConverter]::ToUInt32([byte[]]$after[37..40], 0)
+        if ($saved.Length -lt 10 -or $saved[0] -lt 1 -or $saved[0] -gt 2 -or
+            $saved[1] -ne 0 -or $saved[8] -ne 0 -or $saved[9] -ne 1 -or
+            $readTimeout -ne $newTimeout) {
+            throw "Configuration save verification failed source=$($saved[0]) dirty=$($saved[1]) timeout=$readTimeout"
+        }
+        $sequenceSaved = [BitConverter]::ToUInt32([byte[]]$saved[4..7], 0)
+        Write-Output "PASS configuration oldTimeoutMs=$oldTimeout newTimeoutMs=$newTimeout source=$($saved[0]) sequence=$sequenceSaved slotA=$($saved[2]) slotB=$($saved[3])"
+        return
+    }
     $sample = Invoke-CescRequestWithRetry $port 2 1 2 ([byte[]]@(0))
     $raw = [int]$sample[4] -bor ([int]$sample[5] -shl 8)
     $sensorStatus = [int]$sample[2]

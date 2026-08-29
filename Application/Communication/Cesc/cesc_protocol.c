@@ -8,6 +8,7 @@
 #include "firmware_update.h"
 #include "main.h"
 #include "motor_control_config.h"
+#include "motor_config_store.h"
 #include "power_stage.h"
 #include "stm32f4xx_it.h"
 #include "usb_cdc_transport.h"
@@ -32,6 +33,13 @@ enum {
     SERVICE_CONFIGURATION = 0x04,
     SERVICE_MOTOR = 0x05,
     SERVICE_DIAGNOSTIC = 0x06,
+    CONFIG_GET_INFO = 0x00,
+    CONFIG_GET_CURRENT = 0x01,
+    CONFIG_SET_CURRENT = 0x02,
+    CONFIG_SAVE = 0x03,
+    CONFIG_RELOAD = 0x04,
+    CONFIG_RESTORE_DEFAULTS = 0x05,
+    CONFIG_GET_STATUS = 0x06,
     SYSTEM_HELLO = 0x00,
     SYSTEM_GET_DEVICE_INFO = 0x01,
     SYSTEM_PING = 0x02,
@@ -98,6 +106,8 @@ enum {
     FIRMWARE_FAILED = 5,
     TX_SEND_ATTEMPTS = 2
 };
+
+enum { USER_CONFIG_PAYLOAD_SIZE = 41U };
 
 typedef struct {
     volatile uint32_t received_bytes;
@@ -179,6 +189,49 @@ static void write_float(uint8_t *data, float value)
     uint32_t bits;
     memcpy(&bits, &value, sizeof(bits));
     write_u32(data, bits);
+}
+
+static float read_float(const uint8_t *data)
+{
+    const uint32_t bits = read_u32(data);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static uint16_t encode_user_config(uint8_t *data,
+                                   const motor_user_config_t *config)
+{
+    uint16_t index = 0U;
+    data[index++] = config->pole_pairs;
+    write_float(&data[index], config->torque_constant_nm_per_amp); index += 4U;
+    write_float(&data[index], config->motor_resistance_ohm); index += 4U;
+    write_float(&data[index], config->motor_inductance_h); index += 4U;
+    write_float(&data[index], config->motor_flux_linkage_wb); index += 4U;
+    write_u32(&data[index], (uint32_t)config->maximum_iq_ma); index += 4U;
+    write_u32(&data[index], (uint32_t)config->maximum_speed_mdps); index += 4U;
+    write_u32(&data[index], (uint32_t)config->maximum_position_mdeg); index += 4U;
+    write_u32(&data[index], config->minimum_bus_voltage_mv); index += 4U;
+    write_u32(&data[index], config->maximum_bus_voltage_mv); index += 4U;
+    write_u32(&data[index], config->command_timeout_ms); index += 4U;
+    return index;
+}
+
+static void decode_user_config(const uint8_t *data,
+                               motor_user_config_t *config)
+{
+    memset(config, 0, sizeof(*config));
+    config->pole_pairs = data[0];
+    config->torque_constant_nm_per_amp = read_float(&data[1]);
+    config->motor_resistance_ohm = read_float(&data[5]);
+    config->motor_inductance_h = read_float(&data[9]);
+    config->motor_flux_linkage_wb = read_float(&data[13]);
+    config->maximum_iq_ma = (int32_t)read_u32(&data[17]);
+    config->maximum_speed_mdps = (int32_t)read_u32(&data[21]);
+    config->maximum_position_mdeg = (int32_t)read_u32(&data[25]);
+    config->minimum_bus_voltage_mv = read_u32(&data[29]);
+    config->maximum_bus_voltage_mv = read_u32(&data[33]);
+    config->command_timeout_ms = read_u32(&data[37]);
 }
 
 static uint16_t append_string(uint8_t *data, uint16_t index,
@@ -1021,6 +1074,83 @@ static void motor_service(uint8_t command, uint16_t sequence,
     }
 }
 
+static void configuration_service(uint8_t command, uint16_t sequence,
+                                  const uint8_t *payload, uint16_t length)
+{
+    uint16_t index = 2U;
+    motor_user_config_t config;
+    motor_config_store_status_t store;
+    uint16_t status = STATUS_OK;
+
+    switch (command)
+    {
+    case CONFIG_GET_INFO:
+        if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        write_u16(&response_buffer[index], 1U); index += 2U;
+        write_u16(&response_buffer[index], USER_CONFIG_PAYLOAD_SIZE); index += 2U;
+        write_u32(&response_buffer[index], 0x0000007FUL); index += 4U;
+        break;
+    case CONFIG_GET_CURRENT:
+        if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        motor_control_config_get_user(&config);
+        index += encode_user_config(&response_buffer[index], &config);
+        break;
+    case CONFIG_SET_CURRENT:
+        if (length != USER_CONFIG_PAYLOAD_SIZE) {
+            status = STATUS_INVALID_LENGTH;
+            break;
+        }
+        if (power_stage_get_state() != POWER_STAGE_READY) {
+            status = STATUS_NOT_READY;
+            break;
+        }
+        decode_user_config(payload, &config);
+        if (!motor_config_store_stage(&config)) status = STATUS_OUT_OF_RANGE;
+        break;
+    case CONFIG_SAVE:
+        if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        if (power_stage_get_state() != POWER_STAGE_READY) {
+            status = STATUS_NOT_READY;
+        } else if (!motor_config_store_request_save()) {
+            status = STATUS_BUSY;
+        }
+        break;
+    case CONFIG_RELOAD:
+        if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        if (power_stage_get_state() != POWER_STAGE_READY) {
+            status = STATUS_NOT_READY;
+        } else if (!motor_config_store_reload()) {
+            status = STATUS_NOT_READY;
+        }
+        break;
+    case CONFIG_RESTORE_DEFAULTS:
+        if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        if (power_stage_get_state() != POWER_STAGE_READY) {
+            status = STATUS_NOT_READY;
+        } else {
+            motor_config_store_restore_defaults();
+        }
+        break;
+    case CONFIG_GET_STATUS:
+        if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        motor_config_store_get_status(&store);
+        response_buffer[index++] = (uint8_t)store.source;
+        response_buffer[index++] = store.dirty ? 1U : 0U;
+        response_buffer[index++] = store.slot_a_valid ? 1U : 0U;
+        response_buffer[index++] = store.slot_b_valid ? 1U : 0U;
+        write_u32(&response_buffer[index], store.sequence); index += 4U;
+        response_buffer[index++] = store.save_pending ? 1U : 0U;
+        response_buffer[index++] = store.last_save_ok ? 1U : 0U;
+        break;
+    default:
+        ++stats.unsupported_requests;
+        status = STATUS_INVALID_COMMAND;
+        break;
+    }
+    send_response(SERVICE_CONFIGURATION, command, sequence, status,
+                  status == STATUS_OK ? (uint16_t)(index - 2U) : 0U);
+}
+
 static void dispatch_request(uint8_t service, uint8_t command,
                              uint16_t sequence, const uint8_t *payload,
                              uint16_t length)
@@ -1037,7 +1167,7 @@ static void dispatch_request(uint8_t service, uint8_t command,
     case SERVICE_SENSOR: sensor_service(command, sequence, payload, length); break;
     case SERVICE_TELEMETRY: telemetry_service(command, sequence, payload, length); break;
     case SERVICE_MOTOR: motor_service(command, sequence, payload, length); break;
-    case SERVICE_CONFIGURATION:
+    case SERVICE_CONFIGURATION: configuration_service(command, sequence, payload, length); break;
     case SERVICE_DIAGNOSTIC:
         send_response(service, command, sequence, STATUS_NOT_SUPPORTED, 0U);
         break;

@@ -1,6 +1,7 @@
 #ifndef MOTOR_CONTROL_CONFIG_H
 #define MOTOR_CONTROL_CONFIG_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -93,6 +94,26 @@ typedef struct {
   float position_full_output_error_counts;
 } motor_control_config_t;
 
-extern const motor_control_config_t motor_control_config;
+typedef struct {
+  uint8_t pole_pairs;
+  float torque_constant_nm_per_amp;
+  float motor_resistance_ohm;
+  float motor_inductance_h;
+  float motor_flux_linkage_wb;
+  int32_t maximum_iq_ma;
+  int32_t maximum_speed_mdps;
+  int32_t maximum_position_mdeg;
+  uint32_t minimum_bus_voltage_mv;
+  uint32_t maximum_bus_voltage_mv;
+  uint32_t command_timeout_ms;
+} motor_user_config_t;
+
+extern motor_control_config_t motor_control_config;
+extern const motor_control_config_t motor_control_default_config;
+
+void motor_control_config_get_user(motor_user_config_t *config);
+void motor_control_config_get_default_user(motor_user_config_t *config);
+bool motor_control_config_validate_user(const motor_user_config_t *config);
+bool motor_control_config_apply_user(const motor_user_config_t *config);
 
 #endif
