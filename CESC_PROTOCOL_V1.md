@@ -203,7 +203,7 @@ enum CescServiceId {
 };
 ```
 
-Configuration 和 Motor ID 在版本 1 中保留。命令格式规定前，实现 MUST 返回 `NOT_SUPPORTED`。
+Configuration 服务由能力位 bit 3 宣告并按第 10A 节实现；未声明对应能力的服务 MUST 返回 `NOT_SUPPORTED`。
 
 ## 7. 系统服务（`0x00`）
 
@@ -566,6 +566,57 @@ firstTimestampUs + i * samplePeriodUs
 
 流传输为尽力而为。带宽耗尽时，固件 SHOULD 丢弃遥测数据，而不得阻塞控制、请求响应或安全任务。
 
+## 10A. 配置服务（`0x04`）
+
+设备声明能力位 bit 3 后支持本节。配置命令只允许在功率级 `READY` 且没有 Flash 保存操作进行时修改状态；运行中返回 `NOT_READY`，保存进行中返回 `BUSY`。读取配置和保存状态始终允许。
+
+### 10A.1 线缆配置格式
+
+配置 Payload 严格为 41 字节。多字节整数为小端，浮点为 IEEE-754 float32，禁止直接传输编译器结构体。
+
+| 偏移 | 类型 | 字段 |
+|---:|---|---|
+| 0 | uint8 | pole_pairs |
+| 1 | float32 | torque_constant_nm_per_amp |
+| 5 | float32 | motor_resistance_ohm |
+| 9 | float32 | motor_inductance_h |
+| 13 | float32 | motor_flux_linkage_wb |
+| 17 | int32 | maximum_iq_ma |
+| 21 | int32 | maximum_speed_mdps |
+| 25 | int32 | maximum_position_mdeg |
+| 29 | uint32 | minimum_bus_voltage_mv |
+| 33 | uint32 | maximum_bus_voltage_mv |
+| 37 | uint32 | command_timeout_ms |
+
+固件在应用任何字段前必须完成全部长度、有限浮点、范围和关联约束校验。校验失败返回 `OUT_OF_RANGE`，RAM 配置保持不变。
+
+### 10A.2 命令
+
+| 命令 | ID | 请求 | 成功响应数据 |
+|---|---:|---|---|
+| GET_CURRENT | `0x01` | 空 | 41 字节配置 |
+| SET_CURRENT | `0x02` | 41 字节配置 | 空 |
+| SAVE | `0x03` | 空 | 空；表示保存请求已接受 |
+| RELOAD | `0x04` | 空 | 空 |
+| RESTORE_DEFAULTS | `0x05` | 空 | 空；不自动保存 |
+| GET_STATUS | `0x06` | 空 | 10 字节保存状态 |
+
+`SAVE` 在发送成功响应前必须令 `savePending=1` 并清除旧的 `lastSaveOk`。相同会话中相同 Sequence 的短期重试不得触发第二次擦写。Flash 操作完成后最后清除 `savePending`。
+
+保存状态格式：
+
+| 偏移 | 类型 | 字段 |
+|---:|---|---|
+| 0 | uint8 | source：0 默认值，1 槽 A，2 槽 B |
+| 1 | uint8 | dirty |
+| 2 | uint8 | slotAValid |
+| 3 | uint8 | slotBValid |
+| 4 | uint32 | sequence |
+| 8 | uint8 | savePending |
+| 9 | uint8 | lastSaveOk |
+
+持久化使用 STM32F405 Sector 6 (`0x08040000`) 和 Sector 7 (`0x08060000`) 两个独立槽。记录包含 magic、格式版本、长度、递增序号、CRC-32 和最后写入的提交标记。启动时选择有效且序号较新的槽；一个槽损坏时回退到另一个槽，两个槽均损坏时使用当前固件的默认配置（24 V 默认保护窗口为 18--30 V）。
+
 ## 11. 电机服务（`0x05`）
 
 ### 11.1 `GET_POWER_STAGE_STATUS`（`0x00`）
@@ -871,6 +922,12 @@ CRC bytes:     60 0D
 | Telemetry | STOP_ALL | `0x03` | Request/Response |
 | Telemetry | GET_STREAM_STATUS | `0x04` | Request/Response |
 | Telemetry | STREAM_DATA | `0x80` | Stream |
+| Configuration | GET_CURRENT | `0x01` | Request/Response |
+| Configuration | SET_CURRENT | `0x02` | Request/Response |
+| Configuration | SAVE | `0x03` | Request/Response |
+| Configuration | RELOAD | `0x04` | Request/Response |
+| Configuration | RESTORE_DEFAULTS | `0x05` | Request/Response |
+| Configuration | GET_STATUS | `0x06` | Request/Response |
 | Motor | GET_POWER_STAGE_STATUS | `0x00` | Request/Response |
 | Motor | START_COMMISSIONING_TEST | `0x01` | Request/Response |
 | Motor | STOP | `0x02` | Request/Response |

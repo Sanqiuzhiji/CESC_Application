@@ -9,11 +9,14 @@ are not implemented in this project.
 
 | Region | Address | Purpose |
 |---|---:|---|
-| Sectors 0-7 | `0x08000000` - `0x0807FFFF` | Application |
+| Sectors 0-5 | `0x08000000` - `0x0803FFFF` | Application |
+| Sector 6 | `0x08040000` - `0x0805FFFF` | Motor configuration slot A |
+| Sector 7 | `0x08060000` - `0x0807FFFF` | Motor configuration slot B |
 | Sectors 8-10 | `0x08080000` - `0x080DFFFF` | Download staging area |
 | Sector 11 | `0x080E0000` - `0x080FFFFF` | Reserved for the separate CESC_Bootloader project |
 
-The application linker limits the generated image to 393210 bytes. The first
+The application linker limits the generated image to 262138 bytes so sectors
+6 and 7 remain outside the application image. The first
 six bytes of the 384 KiB staging area contain the compatibility header required
 by the existing bootloader: a four-byte big-endian image length and a two-byte
 CRC16. CESC Protocol V1 transfers raw image offsets beginning at zero; the

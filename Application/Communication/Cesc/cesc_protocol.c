@@ -91,6 +91,7 @@ enum {
     CAP_FIRMWARE = 1U << 0,
     CAP_SENSOR = 1U << 1,
     CAP_TELEMETRY = 1U << 2,
+    CAP_CONFIGURATION = 1U << 3,
     CAP_MOTOR = 1U << 4,
     DATA_UINT8 = 0,
     DATA_UINT16 = 2,
@@ -150,6 +151,9 @@ static uint32_t update_session_id;
 static uint16_t update_chunk_size;
 static uint8_t firmware_state;
 static uint8_t firmware_last_error;
+static bool config_save_sequence_valid;
+static uint16_t config_save_sequence;
+static uint32_t config_save_accepted_at_ms;
 
 static uint16_t read_u16(const uint8_t *data)
 {
@@ -357,7 +361,8 @@ static void system_service(uint8_t command, uint16_t sequence,
 {
     uint16_t index = 2U;
     const uint64_t capabilities =
-        CAP_FIRMWARE | CAP_SENSOR | CAP_TELEMETRY | CAP_MOTOR;
+        CAP_FIRMWARE | CAP_SENSOR | CAP_TELEMETRY | CAP_CONFIGURATION |
+        CAP_MOTOR;
 
     switch (command)
     {
@@ -376,6 +381,7 @@ static void system_service(uint8_t command, uint16_t sequence,
         else
         {
             session_ready = true;
+            config_save_sequence_valid = false;
             response_buffer[index++] = PROTOCOL_VERSION;
             write_u16(&response_buffer[index], MAX_PAYLOAD); index += 2U;
             write_u64(&response_buffer[index], capabilities); index += 8U;
@@ -751,9 +757,18 @@ static void motor_service(uint8_t command, uint16_t sequence,
 {
     uint16_t index = 2U;
     power_stage_diagnostics_t diagnostics;
+    motor_config_store_status_t config_store;
     cpu_fault_record_t fault_record = {0};
 
     (void)payload;
+    motor_config_store_get_status(&config_store);
+    if (config_store.save_pending &&
+        (command != MOTOR_GET_POWER_STAGE_STATUS) &&
+        (command != MOTOR_STOP) &&
+        (command != MOTOR_GET_CONTROL_STATUS)) {
+        send_response(SERVICE_MOTOR, command, sequence, STATUS_BUSY, 0U);
+        return;
+    }
     switch (command)
     {
     case MOTOR_GET_POWER_STAGE_STATUS:
@@ -1100,35 +1115,69 @@ static void configuration_service(uint8_t command, uint16_t sequence,
             status = STATUS_INVALID_LENGTH;
             break;
         }
+        motor_config_store_get_status(&store);
+        if (store.save_pending) {
+            status = STATUS_BUSY;
+            break;
+        }
         if (power_stage_get_state() != POWER_STAGE_READY) {
             status = STATUS_NOT_READY;
             break;
         }
         decode_user_config(payload, &config);
-        if (!motor_config_store_stage(&config)) status = STATUS_OUT_OF_RANGE;
+        if (!motor_config_store_stage(&config)) {
+            status = STATUS_OUT_OF_RANGE;
+        } else {
+            config_save_sequence_valid = false;
+        }
         break;
     case CONFIG_SAVE:
         if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        if (config_save_sequence_valid &&
+            (sequence == config_save_sequence) &&
+            ((uint32_t)(HAL_GetTick() - config_save_accepted_at_ms) <= 5000U)) {
+            break;
+        }
+        motor_config_store_get_status(&store);
         if (power_stage_get_state() != POWER_STAGE_READY) {
             status = STATUS_NOT_READY;
+        } else if (store.save_pending) {
+            status = STATUS_BUSY;
         } else if (!motor_config_store_request_save()) {
             status = STATUS_BUSY;
+        } else {
+            config_save_sequence_valid = true;
+            config_save_sequence = sequence;
+            config_save_accepted_at_ms = HAL_GetTick();
         }
         break;
     case CONFIG_RELOAD:
         if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        motor_config_store_get_status(&store);
+        if (store.save_pending) {
+            status = STATUS_BUSY;
+            break;
+        }
         if (power_stage_get_state() != POWER_STAGE_READY) {
             status = STATUS_NOT_READY;
         } else if (!motor_config_store_reload()) {
-            status = STATUS_NOT_READY;
+            status = STATUS_VERIFY_FAILED;
+        } else {
+            config_save_sequence_valid = false;
         }
         break;
     case CONFIG_RESTORE_DEFAULTS:
         if (length != 0U) { status = STATUS_INVALID_LENGTH; break; }
+        motor_config_store_get_status(&store);
+        if (store.save_pending) {
+            status = STATUS_BUSY;
+            break;
+        }
         if (power_stage_get_state() != POWER_STAGE_READY) {
             status = STATUS_NOT_READY;
         } else {
             motor_config_store_restore_defaults();
+            config_save_sequence_valid = false;
         }
         break;
     case CONFIG_GET_STATUS:
@@ -1193,6 +1242,9 @@ void cesc_protocol_init(void)
     update_chunk_size = MAX_PAYLOAD - 10U;
     firmware_state = FIRMWARE_IDLE;
     firmware_last_error = 0U;
+    config_save_sequence_valid = false;
+    config_save_sequence = 0U;
+    config_save_accepted_at_ms = 0U;
 }
 
 void cesc_protocol_receive(const uint8_t *data, uint32_t length)

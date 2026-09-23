@@ -115,5 +115,6 @@ void motor_control_config_get_user(motor_user_config_t *config);
 void motor_control_config_get_default_user(motor_user_config_t *config);
 bool motor_control_config_validate_user(const motor_user_config_t *config);
 bool motor_control_config_apply_user(const motor_user_config_t *config);
+void motor_control_config_restore_defaults(void);
 
 #endif

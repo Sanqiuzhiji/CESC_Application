@@ -25,6 +25,19 @@ typedef struct {
 
 static motor_config_store_status_t store_status;
 
+static uint32_t enter_critical(void)
+{
+  const uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  return primask;
+}
+
+static void leave_critical(uint32_t primask)
+{
+  __DMB();
+  if (primask == 0U) __enable_irq();
+}
+
 static uint32_t crc32(const void *data, uint32_t length)
 {
   const uint8_t *bytes = data;
@@ -69,14 +82,16 @@ static const config_record_t *selected_record(void)
 void motor_config_store_init(void)
 {
   memset(&store_status, 0, sizeof(store_status));
-  motor_control_config = motor_control_default_config;
+  motor_control_config_restore_defaults();
   (void)motor_config_store_reload();
 }
 
 bool motor_config_store_stage(const motor_user_config_t *config)
 {
   if (!motor_control_config_apply_user(config)) return false;
+  const uint32_t primask = enter_critical();
   store_status.dirty = true;
+  leave_critical(primask);
   return true;
 }
 
@@ -84,27 +99,33 @@ bool motor_config_store_reload(void)
 {
   const config_record_t *record = selected_record();
   if (record == NULL) {
-    motor_control_config = motor_control_default_config;
+    motor_control_config_restore_defaults();
+    const uint32_t primask = enter_critical();
     store_status.source = MOTOR_CONFIG_SOURCE_DEFAULT;
     store_status.sequence = 0U;
     store_status.dirty = false;
+    leave_critical(primask);
     return false;
   }
-  motor_control_config = motor_control_default_config;
+  motor_control_config_restore_defaults();
   if (!motor_control_config_apply_user(&record->config)) return false;
+  const uint32_t primask = enter_critical();
   store_status.source =
       (record == (const config_record_t *)SLOT_A_ADDRESS) ?
       MOTOR_CONFIG_SOURCE_SLOT_A : MOTOR_CONFIG_SOURCE_SLOT_B;
   store_status.sequence = record->sequence;
   store_status.dirty = false;
+  leave_critical(primask);
   return true;
 }
 
 void motor_config_store_restore_defaults(void)
 {
-  motor_control_config = motor_control_default_config;
+  motor_control_config_restore_defaults();
+  const uint32_t primask = enter_critical();
   store_status.source = MOTOR_CONFIG_SOURCE_DEFAULT;
   store_status.dirty = true;
+  leave_critical(primask);
 }
 
 bool motor_config_store_save(void)
@@ -113,8 +134,9 @@ bool motor_config_store_save(void)
   config_record_t record;
   FLASH_EraseInitTypeDef erase = {0};
   uint32_t sector_error = 0U;
+  const config_record_t *current = selected_record();
   const uint32_t address =
-      store_status.source == MOTOR_CONFIG_SOURCE_SLOT_A ?
+      current == (const config_record_t *)SLOT_A_ADDRESS ?
       SLOT_B_ADDRESS : SLOT_A_ADDRESS;
   const uint32_t sector =
       address == SLOT_A_ADDRESS ? FLASH_SECTOR_6 : FLASH_SECTOR_7;
@@ -124,12 +146,12 @@ bool motor_config_store_save(void)
   record.magic = CONFIG_MAGIC;
   record.version = CONFIG_VERSION;
   record.payload_size = sizeof(motor_user_config_t);
-  record.sequence = store_status.sequence + 1U;
+  record.sequence = current != NULL ? current->sequence + 1U : 1U;
   record.config = user;
   record.crc32 = crc32(&record, offsetof(config_record_t, crc32));
   record.commit = CONFIG_COMMIT;
 
-  HAL_FLASH_Unlock();
+  if (HAL_FLASH_Unlock() != HAL_OK) return false;
   erase.TypeErase = FLASH_TYPEERASE_SECTORS;
   erase.Sector = sector;
   erase.NbSectors = 1U;
@@ -154,22 +176,36 @@ bool motor_config_store_save(void)
 
 bool motor_config_store_request_save(void)
 {
-  if (store_status.save_pending) return false;
+  const uint32_t primask = enter_critical();
+  if (store_status.save_pending) {
+    leave_critical(primask);
+    return false;
+  }
+  /* Clear the old result before publishing pending. The host must not
+   * mistake a previous successful erase for this request. */
+  store_status.last_save_ok = false;
   store_status.save_pending = true;
+  leave_critical(primask);
   return true;
 }
 
 void motor_config_store_process(void)
 {
   if (!store_status.save_pending) return;
-  store_status.last_save_ok = motor_config_store_save();
+  const bool ok = motor_config_store_save();
   /* Publish completion last so a concurrent protocol status read cannot
    * observe "not pending" before dirty/source/sequence and result are final. */
-  __DMB();
+  const uint32_t primask = enter_critical();
+  store_status.last_save_ok = ok;
   store_status.save_pending = false;
+  leave_critical(primask);
 }
 
 void motor_config_store_get_status(motor_config_store_status_t *status)
 {
-  if (status != NULL) *status = store_status;
+  if (status != NULL) {
+    const uint32_t primask = enter_critical();
+    *status = store_status;
+    leave_critical(primask);
+  }
 }

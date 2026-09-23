@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+#include <main.h>
+
 /*
  * Default configuration for the present CESC board and motor. This is the
  * single review point for parameters that an application may later load from
@@ -38,11 +40,12 @@ const motor_control_config_t motor_control_default_config = {
   .sensor_startup_grace_ms = 200U,
   .encoder_max_sample_age_ms = 50U,
   .encoder_invalid_sample_limit = 5U,
-  .minimum_bus_voltage_mv = 6000U,
-  /* Nominal 12 V supply. Keep enough tolerance for adapter regulation and
-   * regenerative transients while rejecting an unintended higher-voltage
-   * source before enabling the bridge. */
-  .maximum_bus_voltage_mv = 15000U,
+  /* Nominal 24 V supply. 18 V rejects a missing/collapsing supply, while
+   * 30 V accepts a regulated 24 V source with tolerance and moderate
+   * regenerative rise. The 30 V trip retains 6 V of margin to the TPS5430
+   * 36 V absolute input limit; it is enforced continuously while running. */
+  .minimum_bus_voltage_mv = 18000U,
+  .maximum_bus_voltage_mv = 30000U,
 
   .encoder_pll_kp = 200.0F,
   .encoder_pll_ki = 3000.0F,
@@ -65,11 +68,14 @@ const motor_control_config_t motor_control_default_config = {
   .speed_iq_ramp_amp_per_second = 1.0F,
   /* Direct-Vq fallback mirrors VESC's speed PI structure, but its output is
    * voltage counts because this board cannot resolve a fine Iq command. */
-  .speed_voltage_kp_counts_per_dps = 0.25F,
-  .speed_voltage_ki_counts_per_degree = 2.00F,
-  .speed_voltage_feedforward_counts_per_dps = 0.75F,
-  .speed_voltage_integral_limit_counts = 600.0F,
-  .speed_voltage_slew_counts_per_second = 3000.0F,
+  /* At 24 V each PWM count produces twice the phase voltage of the original
+   * 12 V setup. Halve the count-domain voltage gains and slew to preserve
+   * the commissioned motor-voltage behavior. */
+  .speed_voltage_kp_counts_per_dps = 0.125F,
+  .speed_voltage_ki_counts_per_degree = 1.00F,
+  .speed_voltage_feedforward_counts_per_dps = 0.375F,
+  .speed_voltage_integral_limit_counts = 300.0F,
+  .speed_voltage_slew_counts_per_second = 1500.0F,
   .speed_voltage_gain_reduction_start_mdps = 2400000,
   .speed_voltage_high_speed_gain_scale = 0.25F,
   .speed_voltage_current_limit_decay_per_second = 4.0F,
@@ -85,9 +91,9 @@ const motor_control_config_t motor_control_default_config = {
    * software hard trip and DRV8301 protection remain unchanged. */
   .speed_voltage_fast_limit_decay_shift = 6U,
   .speed_voltage_fast_limit_hold_ms = 100U,
-  .speed_voltage_limit_recovery_counts_per_second = 1000U,
-  .current_kp_pwm_counts_per_amp = 150.0F,
-  .current_ki_pwm_counts_per_amp_second = 280000.0F,
+  .speed_voltage_limit_recovery_counts_per_second = 500U,
+  .current_kp_pwm_counts_per_amp = 75.0F,
+  .current_ki_pwm_counts_per_amp_second = 140000.0F,
   .current_loop_period_seconds = 0.00005F,
 
   /* Bench commissioning values, using the same phase-parameter convention
@@ -107,14 +113,14 @@ const motor_control_config_t motor_control_default_config = {
    * not disturb the proven encoder control path. */
   .observer_diagnostic_enabled = 0U,
 
-  .current_modulation_divisor = 10U,
-  .high_speed_modulation_divisor = 10U,
-  .direct_voltage_modulation_divisor = 12U,
-  .speed_voltage_max_modulation_divisor = 2U,
+  .current_modulation_divisor = 20U,
+  .high_speed_modulation_divisor = 20U,
+  .direct_voltage_modulation_divisor = 24U,
+  .speed_voltage_max_modulation_divisor = 4U,
   /* TIM8 now samples both V0 and V7 after their settling interval. Keep a
    * small margin below half-period modulation for bootstrap/dead-time and
    * current-amplifier settling. */
-  .speed_voltage_safe_sample_max_counts = 2000U,
+  .speed_voltage_safe_sample_max_counts = 1000U,
   .speed_current_foc_enabled = 0U,
   .high_speed_pll_prediction_enabled = 1U,
   .high_speed_svm_enabled = 0U,
@@ -168,15 +174,16 @@ bool motor_control_config_validate_user(const motor_user_config_t *config)
       config->motor_flux_linkage_wb >= 0.000001F &&
       config->motor_flux_linkage_wb <= 1.0F &&
       config->maximum_iq_ma >= 10 && config->maximum_iq_ma <= 300 &&
-      config->maximum_speed_mdps >= 6000 &&
+      config->maximum_speed_mdps >= 60 &&
       config->maximum_speed_mdps <= 3000000 &&
-      config->maximum_position_mdeg >= 360000 &&
+      config->maximum_position_mdeg >= 360 &&
       config->maximum_position_mdeg <= 36000000 &&
-      config->minimum_bus_voltage_mv >= 3000U &&
-      config->minimum_bus_voltage_mv <= 12000U &&
-      config->maximum_bus_voltage_mv >= 6000U &&
-      config->maximum_bus_voltage_mv <= 15000U &&
-      config->minimum_bus_voltage_mv < config->maximum_bus_voltage_mv &&
+      config->minimum_bus_voltage_mv >= 18000U &&
+      config->minimum_bus_voltage_mv <= 24000U &&
+      config->maximum_bus_voltage_mv >= 25000U &&
+      config->maximum_bus_voltage_mv <= 30000U &&
+      config->minimum_bus_voltage_mv + 1000U <=
+          config->maximum_bus_voltage_mv &&
       config->command_timeout_ms >= 100U &&
       config->command_timeout_ms <= 5000U;
 }
@@ -184,18 +191,33 @@ bool motor_control_config_validate_user(const motor_user_config_t *config)
 bool motor_control_config_apply_user(const motor_user_config_t *config)
 {
   if (!motor_control_config_validate_user(config)) return false;
-  motor_control_config.pole_pairs = config->pole_pairs;
-  motor_control_config.torque_constant_nm_per_amp =
-      config->torque_constant_nm_per_amp;
-  motor_control_config.motor_resistance_ohm = config->motor_resistance_ohm;
-  motor_control_config.motor_inductance_h = config->motor_inductance_h;
-  motor_control_config.motor_flux_linkage_wb = config->motor_flux_linkage_wb;
-  motor_control_config.maximum_iq_ma = config->maximum_iq_ma;
-  motor_control_config.maximum_speed_mdps = config->maximum_speed_mdps;
-  motor_control_config.maximum_profile_speed_mdps = config->maximum_speed_mdps;
-  motor_control_config.maximum_position_mdeg = config->maximum_position_mdeg;
-  motor_control_config.minimum_bus_voltage_mv = config->minimum_bus_voltage_mv;
-  motor_control_config.maximum_bus_voltage_mv = config->maximum_bus_voltage_mv;
-  motor_control_config.command_timeout_ms = config->command_timeout_ms;
+  motor_control_config_t next = motor_control_config;
+  next.pole_pairs = config->pole_pairs;
+  next.torque_constant_nm_per_amp = config->torque_constant_nm_per_amp;
+  next.motor_resistance_ohm = config->motor_resistance_ohm;
+  next.motor_inductance_h = config->motor_inductance_h;
+  next.motor_flux_linkage_wb = config->motor_flux_linkage_wb;
+  next.maximum_iq_ma = config->maximum_iq_ma;
+  next.maximum_speed_mdps = config->maximum_speed_mdps;
+  next.maximum_profile_speed_mdps = config->maximum_speed_mdps;
+  next.maximum_position_mdeg = config->maximum_position_mdeg;
+  next.minimum_bus_voltage_mv = config->minimum_bus_voltage_mv;
+  next.maximum_bus_voltage_mv = config->maximum_bus_voltage_mv;
+  next.command_timeout_ms = config->command_timeout_ms;
+
+  const uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  motor_control_config = next;
+  __DMB();
+  if (primask == 0U) __enable_irq();
   return true;
+}
+
+void motor_control_config_restore_defaults(void)
+{
+  const uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  motor_control_config = motor_control_default_config;
+  __DMB();
+  if (primask == 0U) __enable_irq();
 }

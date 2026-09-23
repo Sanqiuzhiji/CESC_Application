@@ -16,11 +16,15 @@
 
 enum {
   CURRENT_CALIBRATION_SAMPLES = 1024U,
-  /* Default commissioning ceiling: +/-10% around center-aligned neutral. */
-  COMMISSIONING_MODULATION_DIVISOR = 10U,
-  /* Rs identification needs 2.7 V for 0.5 A into the specified 5.4 ohm phase. */
-  RESISTANCE_MODULATION_DIVISOR = 2U,
-  BUS_VOLTAGE_SAMPLE_PERIOD_MS = 100U,
+  /* Preserve the original 12 V commissioning voltage ceiling on a 24 V bus:
+   * +/-5% around center-aligned neutral. */
+  COMMISSIONING_MODULATION_DIVISOR = 20U,
+  /* Rs identification needs about 2.7 V for 0.5 A into the specified
+   * 5.4-ohm phase. A 1/8 limit provides at most 3 V from a nominal 24 V bus. */
+  RESISTANCE_MODULATION_DIVISOR = 8U,
+  /* Catch a sustained supply or regenerative excursion promptly. Fast
+   * switching spikes still require the board-level suppression network. */
+  BUS_VOLTAGE_SAMPLE_PERIOD_MS = 10U,
   ADC_FULL_SCALE = 4095U,
   ADC_REFERENCE_MV = 3300U,
   BUS_DIVIDER_HIGH_OHMS = 39000U,
@@ -72,9 +76,11 @@ enum {
    * DRV8301 hardware protection remains the final asynchronous safeguard. */
   CURRENT_TRIP_ADC_COUNTS = 40U,
   CURRENT_TRIP_CONSECUTIVE_SAMPLES = 3U,
+  SOFTWARE_UNDERVOLTAGE_FAULT = 1U << 12,
+  SOFTWARE_OVERVOLTAGE_FAULT = 1U << 13,
   SOFTWARE_OVERSPEED_FAULT = 1U << 14,
   SOFTWARE_OVERCURRENT_FAULT = 1U << 15,
-  COMMISSIONING_TEST_MODULATION_DIVISOR = 12U,
+  COMMISSIONING_TEST_MODULATION_DIVISOR = 24U,
   /* VESC uses a second timer reset by every TIM1 update so the current ADCs
    * sample shortly after both zero vectors (V0 and V7). At 168 MHz, 200
    * counts gives the gate driver and current amplifiers about 1.19 us to
@@ -329,12 +335,13 @@ static const float RESISTANCE_MEASUREMENT_TARGET_AMPS = 0.40F;
 static const float CURRENT_FOC_TORQUE_FEEDFORWARD_AMPS = 0.12F;
 /*
  * VESC tunes the current loop with Kp = L / tc and Ki = R / tc. Using the
- * repeatable bench values R=2.20 ohm and L=1.16 mH, converted from volts to
- * TIM1 counts at the nominal 8 V bus, and a conservative tc=4 ms gives these
- * initial gains. VESC's automatic configuration uses tc=1 ms; the slower
- * starting point leaves margin for the CESC ADC's coarse current resolution.
+ * repeatable bench values R=2.20 ohm and L=1.16 mH. The original 8 V bench
+ * gain is halved for the 24 V supply because each TIM1 count now commands
+ * approximately twice the phase voltage of the former 12 V configuration.
+ * VESC's automatic configuration uses tc=1 ms; this slower starting point
+ * leaves margin for the CESC ADC's coarse current resolution.
  */
-static const float RESISTANCE_FOC_KI_COUNTS_PER_AMP_SECOND = 5000.0F;
+static const float RESISTANCE_FOC_KI_COUNTS_PER_AMP_SECOND = 2500.0F;
 #define CURRENT_FOC_DT_SECONDS \
   (motor_control_config.current_loop_period_seconds)
 static const float CURRENT_FOC_POSITION_TO_SPEED_GAIN = 1.0F;
@@ -366,7 +373,7 @@ static const float CURRENT_FOC_SPEED_KI_AMPS_PER_DEGREE = 0.005F;
  * VESC bounds and clamps its speed PID before feeding the Iq current loop.
  * This board resolves about 80.6 mA per ADC count, so speed mode retains that
  * bounded PI structure but drives an encoder-oriented Vq vector directly.
- * ARR/12 is the already bench-proven encoder-voltage-test limit.
+ * ARR/24 preserves the former ARR/12 phase-voltage ceiling on a 24 V bus.
  */
 #define CONTROL_SPEED_VOLTAGE_FULL_OUTPUT_ERROR_COUNTS \
   (motor_control_config.speed_full_output_error_counts)
@@ -1433,6 +1440,25 @@ void power_stage_process(void)
            (BUS_DIVIDER_HIGH_OHMS + BUS_DIVIDER_LOW_OHMS)) /
           ((uint64_t)ADC_FULL_SCALE * BUS_DIVIDER_LOW_OHMS));
       bus_voltage_valid = true;
+    }
+  }
+
+  /* Start-command checks are not sufficient: regeneration can raise the bus
+   * after the bridge is enabled. Continuously remove gate drive and latch a
+   * distinct software fault whenever an active bridge leaves the qualified
+   * 24 V input window. The host must clear the fault after correcting the
+   * supply, so an oscillating rail cannot automatically restart the motor. */
+  if (bus_voltage_valid && (stage_state == POWER_STAGE_RUNNING) &&
+      ((bus_voltage_mv < COMMISSIONING_MIN_BUS_MV) ||
+       (bus_voltage_mv > COMMISSIONING_MAX_BUS_MV))) {
+    const bool overvoltage = bus_voltage_mv > COMMISSIONING_MAX_BUS_MV;
+    power_stage_disable();
+    latched_faults |= overvoltage ? SOFTWARE_OVERVOLTAGE_FAULT :
+                                    SOFTWARE_UNDERVOLTAGE_FAULT;
+    stage_state = POWER_STAGE_FAULT;
+    if (test_state == POWER_STAGE_TEST_RUNNING) {
+      test_state = POWER_STAGE_TEST_ABORTED;
+      test_kind = TEST_KIND_NONE;
     }
   }
 
