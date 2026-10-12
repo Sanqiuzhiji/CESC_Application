@@ -2,6 +2,7 @@
 
 #include "cmsis_os2.h"
 #include "angle_sensor.h"
+#include "motor_config_store.h"
 
 extern osSemaphoreId_t usbRxSemaphoreHandle;
 
@@ -24,6 +25,11 @@ void StartSensorTask(void *argument)
 
     (void)argument;
     (void)angle_sensor_init();
+    uint16_t electrical_zero_raw;
+    if (motor_config_store_get_electrical_zero(&electrical_zero_raw))
+    {
+        (void)angle_sensor_restore_electrical_zero(electrical_zero_raw);
+    }
     next_wake = osKernelGetTickCount();
 
     for (;;)

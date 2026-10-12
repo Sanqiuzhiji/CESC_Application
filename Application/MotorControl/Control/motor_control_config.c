@@ -161,6 +161,9 @@ bool motor_control_config_validate_user(const motor_user_config_t *config)
 {
   return config != NULL && config->pole_pairs >= 1U &&
       config->pole_pairs <= 64U &&
+      config->electrical_zero_valid <= 1U &&
+      (!config->electrical_zero_valid ||
+       config->electrical_zero_raw <= 0x0FFFU) &&
       isfinite(config->torque_constant_nm_per_amp) &&
       config->torque_constant_nm_per_amp >= 0.001F &&
       config->torque_constant_nm_per_amp <= 10.0F &&

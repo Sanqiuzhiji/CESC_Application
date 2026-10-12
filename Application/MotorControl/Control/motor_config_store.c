@@ -24,6 +24,8 @@ typedef struct {
 } config_record_t;
 
 static motor_config_store_status_t store_status;
+static bool electrical_zero_valid;
+static uint16_t electrical_zero_raw;
 
 static uint32_t enter_critical(void)
 {
@@ -82,6 +84,8 @@ static const config_record_t *selected_record(void)
 void motor_config_store_init(void)
 {
   memset(&store_status, 0, sizeof(store_status));
+  electrical_zero_valid = false;
+  electrical_zero_raw = 0U;
   motor_control_config_restore_defaults();
   (void)motor_config_store_reload();
 }
@@ -95,12 +99,35 @@ bool motor_config_store_stage(const motor_user_config_t *config)
   return true;
 }
 
+bool motor_config_store_stage_electrical_zero(uint16_t zero_raw)
+{
+  if (zero_raw > 0x0FFFU) return false;
+  const uint32_t primask = enter_critical();
+  electrical_zero_raw = zero_raw;
+  electrical_zero_valid = true;
+  store_status.dirty = true;
+  leave_critical(primask);
+  return true;
+}
+
+bool motor_config_store_get_electrical_zero(uint16_t *zero_raw)
+{
+  if (zero_raw == NULL) return false;
+  const uint32_t primask = enter_critical();
+  const bool valid = electrical_zero_valid;
+  *zero_raw = electrical_zero_raw;
+  leave_critical(primask);
+  return valid;
+}
+
 bool motor_config_store_reload(void)
 {
   const config_record_t *record = selected_record();
   if (record == NULL) {
     motor_control_config_restore_defaults();
     const uint32_t primask = enter_critical();
+    electrical_zero_valid = false;
+    electrical_zero_raw = 0U;
     store_status.source = MOTOR_CONFIG_SOURCE_DEFAULT;
     store_status.sequence = 0U;
     store_status.dirty = false;
@@ -110,6 +137,8 @@ bool motor_config_store_reload(void)
   motor_control_config_restore_defaults();
   if (!motor_control_config_apply_user(&record->config)) return false;
   const uint32_t primask = enter_critical();
+  electrical_zero_valid = record->config.electrical_zero_valid != 0U;
+  electrical_zero_raw = record->config.electrical_zero_raw;
   store_status.source =
       (record == (const config_record_t *)SLOT_A_ADDRESS) ?
       MOTOR_CONFIG_SOURCE_SLOT_A : MOTOR_CONFIG_SOURCE_SLOT_B;
@@ -123,6 +152,8 @@ void motor_config_store_restore_defaults(void)
 {
   motor_control_config_restore_defaults();
   const uint32_t primask = enter_critical();
+  electrical_zero_valid = false;
+  electrical_zero_raw = 0U;
   store_status.source = MOTOR_CONFIG_SOURCE_DEFAULT;
   store_status.dirty = true;
   leave_critical(primask);
@@ -142,6 +173,8 @@ bool motor_config_store_save(void)
       address == SLOT_A_ADDRESS ? FLASH_SECTOR_6 : FLASH_SECTOR_7;
 
   motor_control_config_get_user(&user);
+  user.electrical_zero_valid = electrical_zero_valid ? 1U : 0U;
+  user.electrical_zero_raw = electrical_zero_raw;
   memset(&record, 0xFF, sizeof(record));
   record.magic = CONFIG_MAGIC;
   record.version = CONFIG_VERSION;

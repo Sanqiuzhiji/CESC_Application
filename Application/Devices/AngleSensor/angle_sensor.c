@@ -316,6 +316,22 @@ bool angle_sensor_calibrate_electrical_zero(uint16_t target_electrical_raw)
     return true;
 }
 
+bool angle_sensor_restore_electrical_zero(uint16_t zero_raw)
+{
+    if (zero_raw > 0x0FFFU) return false;
+    electrical_zero_raw = zero_raw;
+    __DMB();
+    electrical_zero_calibrated = true;
+    return true;
+}
+
+bool angle_sensor_get_electrical_zero(uint16_t *zero_raw)
+{
+    if ((zero_raw == NULL) || !electrical_zero_calibrated) return false;
+    *zero_raw = electrical_zero_raw;
+    return true;
+}
+
 bool angle_sensor_get_electrical_raw_fast(uint16_t *electrical_raw)
 {
     if ((electrical_raw == NULL) || !electrical_zero_calibrated)

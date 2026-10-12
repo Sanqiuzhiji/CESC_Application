@@ -24,6 +24,8 @@ typedef struct {
 
 void motor_config_store_init(void);
 bool motor_config_store_stage(const motor_user_config_t *config);
+bool motor_config_store_stage_electrical_zero(uint16_t electrical_zero_raw);
+bool motor_config_store_get_electrical_zero(uint16_t *electrical_zero_raw);
 bool motor_config_store_save(void);
 bool motor_config_store_request_save(void);
 void motor_config_store_process(void);

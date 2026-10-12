@@ -96,6 +96,12 @@ typedef struct {
 
 typedef struct {
   uint8_t pole_pairs;
+  /* Occupy the three bytes that were previously structure padding so the
+   * on-flash v1 record size and the 41-byte host configuration payload stay
+   * compatible.  The calibration belongs to this motor/encoder assembly and
+   * is managed by motor_config_store rather than the generic host editor. */
+  uint8_t electrical_zero_valid;
+  uint16_t electrical_zero_raw;
   float torque_constant_nm_per_amp;
   float motor_resistance_ohm;
   float motor_inductance_h;

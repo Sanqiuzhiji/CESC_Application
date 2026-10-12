@@ -46,6 +46,12 @@ bool angle_sensor_read_raw(uint16_t *raw);
 /** Calibrate electrical zero using the latest shaft sample at a known target. */
 bool angle_sensor_calibrate_electrical_zero(uint16_t target_electrical_raw);
 
+/** Restore an absolute electrical-zero value persisted for this assembly. */
+bool angle_sensor_restore_electrical_zero(uint16_t electrical_zero_raw);
+
+/** Read the exact zero currently used by the ISR-facing angle cache. */
+bool angle_sensor_get_electrical_zero(uint16_t *electrical_zero_raw);
+
 /** Lock-free cached electrical angle read suitable for the ADC ISR. */
 bool angle_sensor_get_electrical_raw_fast(uint16_t *electrical_raw);
 

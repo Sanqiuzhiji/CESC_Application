@@ -11,6 +11,7 @@
 #include "foc.h"
 #include "foc_observer.h"
 #include "motor_control_config.h"
+#include "motor_config_store.h"
 #include "main.h"
 #include "tim.h"
 
@@ -1921,6 +1922,13 @@ void power_stage_process(void)
         test_alignment_calibrated =
             angle_sensor_calibrate_electrical_zero(target_raw);
         power_stage_disable();
+        uint16_t calibrated_zero_raw;
+        if (test_alignment_calibrated &&
+            angle_sensor_get_electrical_zero(&calibrated_zero_raw)) {
+          test_alignment_calibrated =
+              motor_config_store_stage_electrical_zero(calibrated_zero_raw) &&
+              motor_config_store_request_save();
+        }
         test_state = test_alignment_calibrated ?
             POWER_STAGE_TEST_COMPLETED : POWER_STAGE_TEST_ABORTED;
         test_kind = TEST_KIND_NONE;
