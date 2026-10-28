@@ -17,8 +17,14 @@ param(
     [switch]$RunFluxTest,
     [switch]$RunConfigurationTest,
     [switch]$ReadConfigurationOnly,
+    [switch]$ReadDeviceInfoOnly,
+    [string]$FirmwarePath = "",
     [switch]$RestoreAndSaveDefaults,
-    [ValidateRange(-300, 300)]
+    [ValidateRange(0, 500)]
+    [int]$SetMaximumIqMa = 0,
+    [switch]$RequireSpeedCurrentFoc,
+    [switch]$ExpectThermalShutdown,
+    [ValidateRange(-500, 500)]
     [int]$IqCurrentMa = 50,
     [ValidateRange(500, 5000)]
     [int]$IqDurationMs = 800,
@@ -41,11 +47,11 @@ param(
     [int]$PositionProfileDecelerationMdps2 = 10000,
     [ValidateRange(100, 360000)]
     [int]$HapticDetentSpacingMdeg = 15000,
-    [ValidateRange(0, 300)]
+    [ValidateRange(0, 500)]
     [int]$HapticDetentStrengthMa = 100,
     [ValidateRange(0, 100)]
     [int]$HapticDampingMaPerDps = 10,
-    [ValidateRange(-69, 69)]
+    [ValidateRange(-115, 115)]
     [int]$TorqueTargetMnm = 12,
     [ValidateSet(-1, 1)]
     [int]$CommissioningDirection = 1
@@ -70,6 +76,21 @@ function Get-CescCrc16([byte[]]$Bytes) {
         }
     }
     return $crc
+}
+
+function Get-CescCrc32([byte[]]$Bytes) {
+    [uint32]$crc = [uint32]::MaxValue
+    foreach ($value in $Bytes) {
+        $crc = $crc -bxor [uint32]$value
+        for ($bit = 0; $bit -lt 8; ++$bit) {
+            if (($crc -band 1) -ne 0) {
+                $crc = [uint32](([uint64]$crc -shr 1) -bxor 0xEDB88320L)
+            } else {
+                $crc = [uint32]([uint64]$crc -shr 1)
+            }
+        }
+    }
+    return [uint32]($crc -bxor [uint32]::MaxValue)
 }
 
 function New-CescFrame([byte]$Service, [byte]$Command,
@@ -146,6 +167,101 @@ try {
     $port.Open()
     $port.DiscardInBuffer()
     $hello = Invoke-CescRequestWithRetry $port 0 0 1 ([byte[]]@(1,1,0,0,0,0))
+    if ($FirmwarePath -ne "") {
+        $resolvedFirmwarePath = (Resolve-Path -LiteralPath $FirmwarePath).Path
+        [byte[]]$image = [System.IO.File]::ReadAllBytes($resolvedFirmwarePath)
+        [uint32]$imageCrc32 = Get-CescCrc32 $image
+        [uint16]$firmwareSequence = 2
+        [uint16]$requestedChunkSize = 240
+        [byte[]]$beginPayload = [byte[]]((
+            [BitConverter]::GetBytes([uint32]$image.Length) +
+            [BitConverter]::GetBytes($imageCrc32) +
+            [BitConverter]::GetBytes($requestedChunkSize) +
+            [BitConverter]::GetBytes([uint16]0)))
+        $begin = Invoke-CescRequestWithRetry $port 1 0 $firmwareSequence $beginPayload 5000
+        ++$firmwareSequence
+        if ($begin.Length -ne 10) { throw "Firmware BEGIN response is invalid" }
+        [uint32]$updateSessionId = [BitConverter]::ToUInt32([byte[]]$begin[0..3], 0)
+        [uint16]$chunkSize = [BitConverter]::ToUInt16([byte[]]$begin[4..5], 0)
+        [uint32]$offset = [BitConverter]::ToUInt32([byte[]]$begin[6..9], 0)
+        Write-Output "Firmware BEGIN size=$($image.Length) crc32=0x$($imageCrc32.ToString('X8')) session=$updateSessionId chunk=$chunkSize resumeOffset=$offset"
+        while ($offset -lt $image.Length) {
+            $length = [Math]::Min([int]$chunkSize, $image.Length - [int]$offset)
+            [byte[]]$block = [byte[]]$image[[int]$offset..([int]$offset + $length - 1)]
+            [byte[]]$writePayload = [byte[]]((
+                [BitConverter]::GetBytes($updateSessionId) +
+                [BitConverter]::GetBytes($offset) +
+                [BitConverter]::GetBytes([uint16]$length) + $block))
+            $write = Invoke-CescRequestWithRetry $port 1 1 $firmwareSequence $writePayload 500
+            ++$firmwareSequence
+            $nextOffset = [BitConverter]::ToUInt32([byte[]]$write[0..3], 0)
+            if ($nextOffset -ne ($offset + $length)) {
+                throw "Firmware WRITE offset mismatch current=$offset next=$nextOffset"
+            }
+            $offset = $nextOffset
+            if (($offset % 12000) -lt $chunkSize -or $offset -eq $image.Length) {
+                Write-Output "Firmware WRITE $offset/$($image.Length) bytes"
+            }
+        }
+        $finish = Invoke-CescRequestWithRetry $port 1 2 $firmwareSequence ([BitConverter]::GetBytes($updateSessionId)) 5000
+        ++$firmwareSequence
+        $verifiedSize = [BitConverter]::ToUInt32([byte[]]$finish[0..3], 0)
+        $verifiedCrc32 = [BitConverter]::ToUInt32([byte[]]$finish[4..7], 0)
+        if ($verifiedSize -ne $image.Length -or $verifiedCrc32 -ne $imageCrc32) {
+            throw "Firmware FINISH verification mismatch size=$verifiedSize crc32=0x$($verifiedCrc32.ToString('X8'))"
+        }
+        Write-Output "Firmware FINISH verified size=$verifiedSize crc32=0x$($verifiedCrc32.ToString('X8'))"
+        [byte[]]$activatePayload = [byte[]]((
+            [BitConverter]::GetBytes($updateSessionId) +
+            [BitConverter]::GetBytes([uint16]250)))
+        [void](Invoke-CescRequestWithRetry $port 1 3 $firmwareSequence $activatePayload 1000)
+        Write-Output "PASS firmware activated; wait for USB re-enumeration"
+        return
+    }
+    if ($ReadDeviceInfoOnly) {
+        $deviceInfo = Invoke-CescRequestWithRetry $port 0 1 2 ([byte[]]@())
+        if ($deviceInfo.Length -lt 24) { throw "Device-info response is truncated" }
+        $firmwareMajor = [BitConverter]::ToUInt16([byte[]]$deviceInfo[0..1], 0)
+        $firmwareMinor = [BitConverter]::ToUInt16([byte[]]$deviceInfo[2..3], 0)
+        $firmwarePatch = [BitConverter]::ToUInt16([byte[]]$deviceInfo[4..5], 0)
+        $firmwareVersion = "$firmwareMajor.$firmwareMinor.$firmwarePatch"
+        $bootloaderMajor = [BitConverter]::ToUInt16([byte[]]$deviceInfo[6..7], 0)
+        $bootloaderMinor = [BitConverter]::ToUInt16([byte[]]$deviceInfo[8..9], 0)
+        $bootloaderPatch = [BitConverter]::ToUInt16([byte[]]$deviceInfo[10..11], 0)
+        $bootloaderVersion = "$bootloaderMajor.$bootloaderMinor.$bootloaderPatch"
+        $capabilities = if ($hello.Length -ge 11) {
+            [BitConverter]::ToUInt64([byte[]]$hello[3..10], 0)
+        } else { [uint64]0 }
+        Write-Output "PASS device-info firmware=$firmwareVersion bootloader=$bootloaderVersion capabilities=0x$($capabilities.ToString('X16'))"
+        return
+    }
+    if ($SetMaximumIqMa -ne 0) {
+        [uint16]$configSequence = 2
+        [byte[]]$currentConfig = Invoke-CescRequestWithRetry $port 4 1 $configSequence ([byte[]]@())
+        ++$configSequence
+        if ($currentConfig.Length -ne 41) { throw "Configuration payload length is not 41" }
+        [byte[]]$updatedConfig = [byte[]]$currentConfig.Clone()
+        [BitConverter]::GetBytes([int]$SetMaximumIqMa).CopyTo($updatedConfig, 17)
+        [void](Invoke-CescRequestWithRetry $port 4 2 $configSequence $updatedConfig)
+        ++$configSequence
+        [void](Invoke-CescRequestWithRetry $port 4 3 $configSequence ([byte[]]@()))
+        ++$configSequence
+        $saved = $null
+        for ($poll = 0; $poll -lt 20; ++$poll) {
+            Start-Sleep -Milliseconds 250
+            $saved = Invoke-CescRequestWithRetry $port 4 6 $configSequence ([byte[]]@())
+            ++$configSequence
+            if ($saved.Length -ge 10 -and $saved[8] -eq 0) { break }
+        }
+        [byte[]]$readback = Invoke-CescRequestWithRetry $port 4 1 $configSequence ([byte[]]@())
+        $readbackMaximumIqMa = [BitConverter]::ToInt32([byte[]]$readback[17..20], 0)
+        if ($saved.Length -lt 10 -or $saved[1] -ne 0 -or $saved[8] -ne 0 -or
+            $saved[9] -ne 1 -or $readbackMaximumIqMa -ne $SetMaximumIqMa) {
+            throw "Maximum-Iq save failed requested=$SetMaximumIqMa readback=$readbackMaximumIqMa"
+        }
+        Write-Output "PASS maximum-iq configured=${readbackMaximumIqMa}mA"
+        return
+    }
     if ($RestoreAndSaveDefaults) {
         [void](Invoke-CescRequestWithRetry $port 4 5 2 ([byte[]]@()))
         [void](Invoke-CescRequestWithRetry $port 4 3 3 ([byte[]]@()))
@@ -241,6 +357,31 @@ try {
     $busRaw = [int]$power[4] -bor ([int]$power[5] -shl 8)
     $busMv = [BitConverter]::ToUInt32([byte[]]$power[6..9], 0)
     $currentSequence = [BitConverter]::ToUInt32([byte[]]$power[10..13], 0)
+    if ($power.Length -lt 10) { throw "Power-stage response lacks temperature diagnostics" }
+    $temperatureBase = $power.Length - 10
+    $temperatureRaw = [BitConverter]::ToUInt16([byte[]]$power[$temperatureBase..($temperatureBase + 1)], 0)
+    $temperatureDeciC = [BitConverter]::ToInt16([byte[]]$power[($temperatureBase + 2)..($temperatureBase + 3)], 0)
+    $temperatureStatus = [int]$power[$temperatureBase + 4]
+    $temperatureFaults = [int]$power[$temperatureBase + 5]
+    $thermalCurrentLimitMa = [BitConverter]::ToInt32([byte[]]$power[($temperatureBase + 6)..($temperatureBase + 9)], 0)
+    if ($ExpectThermalShutdown) {
+        if ($powerState -ne 4 -or ($powerFlags -band 0x03) -ne 0 -or
+            ($temperatureFaults -band 0x02) -eq 0 -or
+            $temperatureStatus -ne 5 -or $temperatureDeciC -lt 1000 -or
+            $thermalCurrentLimitMa -ne 0) {
+            throw "Thermal shutdown not proven state=$powerState flags=$powerFlags raw=$temperatureRaw deciC=$temperatureDeciC status=$temperatureStatus faults=$temperatureFaults thermalLimit=$thermalCurrentLimitMa"
+        }
+        $temperatureC = [Math]::Round($temperatureDeciC / 10.0, 1)
+        Write-Output "PASS thermal-shutdown temperatureRaw=$temperatureRaw temperatureC=$temperatureC state=$powerState gateEnabled=false thermalFaults=$temperatureFaults thermalCurrentLimitMa=$thermalCurrentLimitMa"
+        return
+    }
+    if (($powerFlags -band 0x10) -eq 0 -or $temperatureStatus -ne 1 -or
+        $temperatureFaults -ne 0 -or $temperatureRaw -le 16 -or
+        $temperatureRaw -ge 4079 -or $temperatureDeciC -lt -400 -or
+        $temperatureDeciC -gt 1250 -or $thermalCurrentLimitMa -le 0 -or
+        $thermalCurrentLimitMa -gt 500) {
+        throw "Temperature ADC invalid raw=$temperatureRaw deciC=$temperatureDeciC status=$temperatureStatus faults=$temperatureFaults thermalLimit=$thermalCurrentLimitMa flags=$powerFlags"
+    }
     $cpuFaultText = "none"
     if ($power.Length -ge 383) {
         $faultMagic = [BitConverter]::ToUInt32([byte[]]$power[351..354], 0)
@@ -318,6 +459,8 @@ try {
         $iqSampleCount = [Math]::Max(1, [int]($IqDurationMs / 100))
         [long]$idSumMa = 0
         [long]$iqSumMa = 0
+        [int]$previousIqPositionCounts = $positionCounts
+        [long]$previousIqTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
         for ($sampleIndex = 0; $sampleIndex -lt $iqSampleCount; ++$sampleIndex) {
             [void](Assert-CescResponse (Send-CescRequest $port 5 9 $nextSequence $iqPayload) 5 9 $nextSequence)
             ++$nextSequence
@@ -335,6 +478,20 @@ try {
             $iqMa = [BitConverter]::ToInt32([byte[]]$powerAfter[310..313], 0)
             $iqTargetMa = [BitConverter]::ToInt32([byte[]]$powerAfter[314..317], 0)
             $timeoutRemainingMs = [BitConverter]::ToUInt32([byte[]]$powerAfter[318..321], 0)
+            $controlDuringIq = Invoke-CescRequestWithRetry $port 5 15 $nextSequence ([byte[]]@())
+            ++$nextSequence
+            if ($controlDuringIq.Length -lt 22) { throw "Control-status response is truncated" }
+            $positionDuringIq = Invoke-CescRequestWithRetry $port 2 1 $nextSequence ([byte[]]@(0))
+            ++$nextSequence
+            [int]$positionCountsDuringIq = [BitConverter]::ToInt32([byte[]]$positionDuringIq[18..21], 0)
+            [long]$iqTimestamp = [System.Diagnostics.Stopwatch]::GetTimestamp()
+            $iqElapsedSeconds = ($iqTimestamp - $previousIqTimestamp) / [double][System.Diagnostics.Stopwatch]::Frequency
+            $speedDuringIqRpm = (($positionCountsDuringIq - $previousIqPositionCounts) / 4096.0) * 60.0 / $iqElapsedSeconds
+            $previousIqPositionCounts = $positionCountsDuringIq
+            $previousIqTimestamp = $iqTimestamp
+            if ([Math]::Abs($speedDuringIqRpm) -gt 500.0) {
+                throw "Iq step exceeded 500 RPM encoderRpm=$speedDuringIqRpm"
+            }
             $idSumMa += $idMa
             $iqSumMa += $iqMa
             if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
@@ -342,7 +499,8 @@ try {
                 $iqTargetMa -ne $IqCurrentMa -or $timeoutRemainingMs -eq 0) {
                 throw "Iq control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode Id=$idMa Iq=$iqMa target=$iqTargetMa timeout=$timeoutRemainingMs"
             }
-            Write-Output "Iq control sample=$sampleIndex Id=${idMa}mA Iq=${iqMa}mA target=${iqTargetMa}mA timeout=${timeoutRemainingMs}ms"
+            $speedDuringIqRpm = [Math]::Round($speedDuringIqRpm, 2)
+            Write-Output "Iq control sample=$sampleIndex Id=${idMa}mA Iq=${iqMa}mA target=${iqTargetMa}mA speed=${speedDuringIqRpm}rpm timeout=${timeoutRemainingMs}ms"
         }
         $transformSamples = [BitConverter]::ToUInt32([byte[]]$powerAfter[110..113], 0)
         $idTransformSumMa = [BitConverter]::ToInt64([byte[]]$powerAfter[114..121], 0)
@@ -361,7 +519,7 @@ try {
         if ($VerifyIqWatchdog) {
             Start-Sleep -Milliseconds 700
         } else {
-            [void](Assert-CescResponse (Send-CescRequest $port 5 2 $nextSequence ([byte[]]@())) 5 2 $nextSequence)
+            [void](Invoke-CescRequestWithRetry $port 5 2 $nextSequence ([byte[]]@()))
             ++$nextSequence
             Start-Sleep -Milliseconds 100
         }
@@ -471,6 +629,9 @@ try {
             $speedTargetNow = [BitConverter]::ToInt32([byte[]]$controlAfter[10..13], 0)
             $speedReferenceNow = [BitConverter]::ToInt32([byte[]]$controlAfter[14..17], 0)
             $speedActualNow = [BitConverter]::ToInt32([byte[]]$controlAfter[18..21], 0)
+            if ([Math]::Abs($speedActualNow) -gt 3000000) {
+                throw "Speed test exceeded 500 RPM actualMdps=$speedActualNow"
+            }
             $iqTargetMa = [BitConverter]::ToInt32([byte[]]$controlAfter[30..33], 0)
             $iqActualMa = [BitConverter]::ToInt32([byte[]]$controlAfter[26..29], 0)
             $predictedElectricalRaw = [BitConverter]::ToUInt16([byte[]]$controlAfter[34..35], 0)
@@ -511,7 +672,8 @@ try {
             if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
                 $faultsNow -ne 0 -or $controlMode -ne 2 -or
                 $speedTargetNow -ne $SpeedTargetMdps -or
-                [Math]::Abs($iqTargetMa) -gt 300) {
+                [Math]::Abs($iqTargetMa) -gt 500 -or
+                ($RequireSpeedCurrentFoc -and $speedCurrentFoc -ne 1)) {
                 throw "Speed control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode target=$speedTargetNow actual=$speedActualNow iqTarget=$iqTargetMa"
             }
             if (($sampleIndex % $SpeedLogEvery) -eq 0 -or
@@ -578,7 +740,7 @@ try {
             if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
                 $faultsNow -ne 0 -or $controlMode -ne 3 -or
                 $targetNow -ne $positionTargetMdeg -or
-                [Math]::Abs($positionIqTargetMa) -gt 300) {
+                [Math]::Abs($positionIqTargetMa) -gt 500) {
                 throw "Position control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode target=$targetNow actual=$positionFeedbackMdeg speed=$positionSpeedMdps iqTarget=$positionIqTargetMa"
             }
             Write-Output "Position sample=$sampleIndex target=${targetNow}mdeg actual=${positionFeedbackMdeg}mdeg speed=${positionSpeedMdps}mdps iqTarget=${positionIqTargetMa}mA"
@@ -672,7 +834,7 @@ try {
             if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
                 $faultsNow -ne 0 -or $controlMode -ne 4 -or
                 $targetNow -ne $profileTargetMdeg -or
-                [Math]::Abs($profileIqTargetMa) -gt 300) {
+                [Math]::Abs($profileIqTargetMa) -gt 500) {
                 throw "Position profile invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode target=$targetNow actual=$profileFeedbackMdeg speed=$profileActualSpeedMdps iqTarget=$profileIqTargetMa"
             }
             Write-Output "Profile sample=$sampleIndex target=${targetNow}mdeg actual=${profileFeedbackMdeg}mdeg speed=${profileActualSpeedMdps}mdps speedTarget=${profileSpeedTargetMdps}mdps speedReference=${profileSpeedReferenceMdps}mdps Vq=$profileVoltageQCounts/$profileVoltageLimitCounts currentLimited=$profileCurrentLimited currentFoc=$profileCurrentFoc Iq=${profileIqActualMa}mA iqTarget=${profileIqTargetMa}mA"
@@ -714,7 +876,7 @@ try {
             $hapticPositionMdeg = [BitConverter]::ToInt32([byte[]]$powerAfter[334..337], 0)
             if ($stateNow -ne 3 -or ($flagsNow -band 0x03) -ne 0x03 -or
                 $faultsNow -ne 0 -or $controlMode -ne 5 -or
-                [Math]::Abs($hapticIqTargetMa) -gt 300) {
+                [Math]::Abs($hapticIqTargetMa) -gt 500) {
                 throw "Haptic control invalid state=$stateNow flags=$flagsNow faults=$faultsNow mode=$controlMode position=$hapticPositionMdeg speed=$hapticSpeedMdps iqTarget=$hapticIqTargetMa"
             }
             Write-Output "Haptic sample=$sampleIndex position=${hapticPositionMdeg}mdeg speed=${hapticSpeedMdps}mdps iqTarget=${hapticIqTargetMa}mA"
@@ -1080,7 +1242,8 @@ try {
     [uint32]$usbDropAfter = [BitConverter]::ToUInt32([byte[]]$commStatsAfter[48..51], 0)
     $usbDiagnosticText = "mutex=$usbMutexAfter(+$($usbMutexAfter-$usbMutexBefore)) submit=$usbSubmitAfter(+$($usbSubmitAfter-$usbSubmitBefore)) complete=$usbCompleteAfter(+$($usbCompleteAfter-$usbCompleteBefore)) drops=$usbDropAfter(+$($usbDropAfter-$usbDropBefore))"
     if ($streamFrames -lt 5) { throw "Expected telemetry frames, got $streamFrames" }
-    Write-Output "PASS port=$PortName sensorStatus=$sensorStatus angleRaw=$raw angle=$angle positionCounts=$positionCounts positionDegrees=$positionDegrees electricalRaw=$electricalRaw electricalDegrees=$electricalDegrees polePairs=$polePairs angleFlags=$angleFlags electricalZeroRaw=$electricalZeroRaw alignedElectricalRaw=$alignedElectricalRaw alignedElectricalDegrees=$alignedElectricalDegrees powerState=$powerState flags=$powerFlags drvFaults=$drvFaults busRaw=$busRaw busMv=$busMv currentSeq=$currentSequence phases(raw/offset/centered)=$($phaseText -join ',') cpuFault=[$cpuFaultText] motorTest=[$motorResult] usb=[$usbDiagnosticText] streamId=$streamId frames=$streamFrames"
+    $temperatureC = [Math]::Round($temperatureDeciC / 10.0, 1)
+    Write-Output "PASS port=$PortName sensorStatus=$sensorStatus angleRaw=$raw angle=$angle positionCounts=$positionCounts positionDegrees=$positionDegrees electricalRaw=$electricalRaw electricalDegrees=$electricalDegrees polePairs=$polePairs angleFlags=$angleFlags electricalZeroRaw=$electricalZeroRaw alignedElectricalRaw=$alignedElectricalRaw alignedElectricalDegrees=$alignedElectricalDegrees powerState=$powerState flags=$powerFlags drvFaults=$drvFaults busRaw=$busRaw busMv=$busMv temperatureRaw=$temperatureRaw temperatureC=$temperatureC temperatureStatus=$temperatureStatus temperatureFaults=$temperatureFaults thermalCurrentLimitMa=$thermalCurrentLimitMa currentSeq=$currentSequence phases(raw/offset/centered)=$($phaseText -join ',') cpuFault=[$cpuFaultText] motorTest=[$motorResult] usb=[$usbDiagnosticText] streamId=$streamId frames=$streamFrames"
 } finally {
     if ($port.IsOpen) {
         try { [void](Send-CescRequest $port 5 2 0xffff ([byte[]]@()) 20) } catch {}

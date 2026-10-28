@@ -484,6 +484,8 @@ enum CescDataType {
 
 流内数值采用通道枚举返回的类型和顺序。
 
+当前固件固定通道为：0轴角原始值（uint16/count）、1轴角（float32/deg）、2角度传感器状态（uint8/enum）、3板载温度ADC（uint16/count）、4板载温度（float32/degC）、5板载温度状态（uint8/enum）、6温度降额电流上限（int32/mA）。既有通道ID保持稳定。
+
 ### 10.2 `ENUM_CHANNELS`（`0x00`）
 
 ```text
@@ -625,7 +627,7 @@ firstTimestampUs + i * samplePeriodUs
 
 ```text
 uint8  state              // 0=未初始化, 1=校准中, 2=就绪, 3=运行, 4=故障
-uint8  flags              // bit0 EN_GATE, bit1 六路PWM, bit2 nFAULT有效, bit3母线电压有效
+uint8  flags              // bit0 EN_GATE, bit1 六路PWM, bit2 nFAULT有效, bit3母线电压有效, bit4板载温度有效
 uint16 drvFaults
 uint16 busVoltageRaw
 uint32 busVoltageMv
@@ -637,6 +639,18 @@ uint32 currentSequence
 uint8  testState          // 0=空闲, 1=运行, 2=完成, 3=中止
 uint8  testStepsCompleted // 本次标定测试已完成的换相步数
 ```
+
+完整诊断响应和 `GET_CONTROL_STATUS (0x0F)` 均在各自旧版响应末尾追加同一10字节温度尾部：
+
+```text
+uint16 boardTemperatureRaw
+int16  boardTemperatureDeciC // 无效时 INT16_MIN
+uint8  boardTemperatureStatus // 0未初始化, 1正常, 2开路, 3短路, 4无效, 5过温
+uint8  thermalFaults          // bit0传感器故障, bit1过温
+int32  thermalCurrentLimitMa
+```
+
+PA3使用高侧10 kΩ NTC和低侧10 kΩ固定电阻。固件默认Beta为3380 K，85°C开始线性降额，100°C关闭功率级并锁存故障；连续5次检测到开路或短路同样锁存关断。
 
 `currentCentered = currentRaw - currentOffset`，单位为 ADC count。电流放大器增益确认前不得将其解释为安培。
 
@@ -716,7 +730,7 @@ Rs          = (Rs_forward + Rs_reverse) / 2
 
 请求 Payload 为小端 `int32 iqTargetMa`。这是参考 VESC
 `CONTROL_MODE_CURRENT` 的第一版正式有感 FOC 电流模式：`Id_target=0`，正负
-`Iq` 决定正反力矩。当前安全范围为 `-300..+300 mA`；绝对值小于 10 mA
+`Iq` 决定正反力矩。当前第一阶段安全范围为 `-500..+500 mA`；绝对值小于 10 mA
 （包括 0）立即关闭 PWM 和 EN_GATE，释放电机。
 
 非零命令要求功率级 READY、母线 6–10 V、无锁存故障、没有正在运行的
@@ -769,7 +783,7 @@ millidegree/s²。固件生成带加速和提前减速的梯形/三角形位置�
 阻尼系数（mA/(degree/s)）、最小位置和最大位置（millidegree）。允许范围分别为
 100..360000、0..300、0..100，位置边界必须递增且位于 ±3600000 内。
 固件输出最近卡点的回正力矩、与转速成比例的阻尼以及位置边界的虚拟限位力矩，
-总 `Iq` 硬限制为 ±300 mA。该命令同样需要每 500 ms 内刷新并使用 `STOP` 退出。
+总 `Iq` 硬限制为 ±500 mA。该命令同样需要每 500 ms 内刷新并使用 `STOP` 退出。
 
 ### 11.10 `SET_TORQUE`（`0x0E`）
 

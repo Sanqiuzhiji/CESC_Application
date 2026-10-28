@@ -46,6 +46,14 @@ const motor_control_config_t motor_control_default_config = {
    * 36 V absolute input limit; it is enforced continuously while running. */
   .minimum_bus_voltage_mv = 18000U,
   .maximum_bus_voltage_mv = 30000U,
+  /* PA3 senses a high-side 10 kOhm NTC over a low-side 10 kOhm resistor.
+   * Beta 3380 K matches the Benjamin/VESC default. Replace it with the exact
+   * R24 datasheet value when the fitted part number is known. */
+  .board_ntc_beta = 3380.0F,
+  .board_ntc_nominal_ohms = 10000U,
+  .board_ntc_fixed_ohms = 10000U,
+  .board_temperature_derate_start_c = 85.0F,
+  .board_temperature_shutdown_c = 100.0F,
 
   .encoder_pll_kp = 200.0F,
   .encoder_pll_ki = 3000.0F,

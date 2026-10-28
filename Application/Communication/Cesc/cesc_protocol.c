@@ -95,12 +95,17 @@ enum {
     CAP_MOTOR = 1U << 4,
     DATA_UINT8 = 0,
     DATA_UINT16 = 2,
+    DATA_INT32 = 5,
     DATA_FLOAT32 = 8,
     MAX_STREAM_CHANNELS = 8,
     CHANNEL_RAW_ANGLE = 0,
     CHANNEL_ANGLE_DEGREES = 1,
     CHANNEL_SENSOR_STATUS = 2,
-    CHANNEL_COUNT = 3,
+    CHANNEL_BOARD_TEMPERATURE_RAW = 3,
+    CHANNEL_BOARD_TEMPERATURE = 4,
+    CHANNEL_BOARD_TEMPERATURE_STATUS = 5,
+    CHANNEL_THERMAL_CURRENT_LIMIT = 6,
+    CHANNEL_COUNT = 7,
     FIRMWARE_IDLE = 0,
     FIRMWARE_RECEIVING = 2,
     FIRMWARE_READY = 4,
@@ -660,9 +665,15 @@ static void sensor_service(uint8_t command, uint16_t sequence,
 static uint16_t append_channel_descriptor(uint8_t *data, uint16_t index,
                                           uint16_t channel)
 {
-    static const char *const names[] = {"shaft_angle_raw", "shaft_angle", "shaft_sensor_status"};
-    static const char *const units[] = {"count", "deg", "enum"};
-    static const uint8_t types[] = {DATA_UINT16, DATA_FLOAT32, DATA_UINT8};
+    static const char *const names[] = {
+        "shaft_angle_raw", "shaft_angle", "shaft_sensor_status",
+        "board_temperature_raw", "board_temperature",
+        "board_temperature_status", "thermal_current_limit"};
+    static const char *const units[] = {
+        "count", "deg", "enum", "count", "degC", "enum", "mA"};
+    static const uint8_t types[] = {
+        DATA_UINT16, DATA_FLOAT32, DATA_UINT8, DATA_UINT16,
+        DATA_FLOAT32, DATA_UINT8, DATA_INT32};
     write_u16(&data[index], channel); index += 2U;
     data[index++] = types[channel];
     write_float(&data[index], 1.0F); index += 4U;
@@ -779,7 +790,11 @@ static void motor_service(uint8_t command, uint16_t sequence,
             (diagnostics.gate_enabled ? 1U : 0U) |
             (diagnostics.pwm_outputs_enabled ? 2U : 0U) |
             (diagnostics.fault_pin_active ? 4U : 0U) |
-            (diagnostics.bus_voltage_valid ? 8U : 0U);
+            (diagnostics.bus_voltage_valid ? 8U : 0U) |
+            ((diagnostics.board_temperature_status ==
+                  POWER_STAGE_TEMPERATURE_OK ||
+              diagnostics.board_temperature_status ==
+                  POWER_STAGE_TEMPERATURE_OVERTEMP) ? 16U : 0U);
         write_u16(&response_buffer[index], diagnostics.drv_faults); index += 2U;
         write_u16(&response_buffer[index], diagnostics.bus_voltage_raw); index += 2U;
         write_u32(&response_buffer[index], diagnostics.bus_voltage_mv); index += 4U;
@@ -879,6 +894,15 @@ static void motor_service(uint8_t command, uint16_t sequence,
         write_u32(&response_buffer[index], fault_record.lr); index += 4U;
         response_buffer[index++] =
             power_stage_is_command_timeout_latched() ? 1U : 0U;
+        write_u16(&response_buffer[index],
+                  diagnostics.board_temperature_raw); index += 2U;
+        write_u16(&response_buffer[index],
+                  (uint16_t)diagnostics.board_temperature_deci_c); index += 2U;
+        response_buffer[index++] =
+            (uint8_t)diagnostics.board_temperature_status;
+        response_buffer[index++] = diagnostics.thermal_faults;
+        write_u32(&response_buffer[index],
+                  (uint32_t)diagnostics.thermal_current_limit_ma); index += 4U;
         send_response(SERVICE_MOTOR, command, sequence, STATUS_OK,
                       (uint16_t)(index - 2U));
         return;
@@ -890,7 +914,11 @@ static void motor_service(uint8_t command, uint16_t sequence,
             (diagnostics.gate_enabled ? 1U : 0U) |
             (diagnostics.pwm_outputs_enabled ? 2U : 0U) |
             (diagnostics.fault_pin_active ? 4U : 0U) |
-            (diagnostics.bus_voltage_valid ? 8U : 0U);
+            (diagnostics.bus_voltage_valid ? 8U : 0U) |
+            ((diagnostics.board_temperature_status ==
+                  POWER_STAGE_TEMPERATURE_OK ||
+              diagnostics.board_temperature_status ==
+                  POWER_STAGE_TEMPERATURE_OVERTEMP) ? 16U : 0U);
         write_u16(&response_buffer[index], diagnostics.drv_faults); index += 2U;
         write_u32(&response_buffer[index], diagnostics.bus_voltage_mv); index += 4U;
         response_buffer[index++] = (uint8_t)diagnostics.control_mode;
@@ -927,6 +955,15 @@ static void motor_service(uint8_t command, uint16_t sequence,
         write_u32(&response_buffer[index],
                   (uint32_t)diagnostics.observer_erpm); index += 4U;
         response_buffer[index++] = diagnostics.observer_using_encoder;
+        write_u16(&response_buffer[index],
+                  diagnostics.board_temperature_raw); index += 2U;
+        write_u16(&response_buffer[index],
+                  (uint16_t)diagnostics.board_temperature_deci_c); index += 2U;
+        response_buffer[index++] =
+            (uint8_t)diagnostics.board_temperature_status;
+        response_buffer[index++] = diagnostics.thermal_faults;
+        write_u32(&response_buffer[index],
+                  (uint32_t)diagnostics.thermal_current_limit_ma); index += 4U;
         send_response(SERVICE_MOTOR, command, sequence, STATUS_OK,
                       (uint16_t)(index - 2U));
         return;
@@ -1331,14 +1368,25 @@ void cesc_protocol_periodic(void)
     uint16_t index = 0U;
     const uint32_t now = HAL_GetTick();
     angle_sensor_sample_t sample;
+    power_stage_diagnostics_t diagnostics;
 
     if (!stream.active || ((int32_t)(now - stream.next_due_ms) < 0)) return;
     stream.next_due_ms = now + (stream.period_us + 999U) / 1000U;
-    if (!angle_sensor_get_sample(&sample)) return;
+    bool need_angle = false;
+    bool need_power_stage = false;
+    for (uint8_t i = 0U; i < stream.channel_count; ++i)
+    {
+        if (stream.channels[i] <= CHANNEL_SENSOR_STATUS) need_angle = true;
+        else need_power_stage = true;
+    }
+    if (need_angle && !angle_sensor_get_sample(&sample)) return;
+    if (need_power_stage && !power_stage_get_diagnostics(&diagnostics)) return;
 
     write_u16(&payload[index], stream.id); index += 2U;
     write_u32(&payload[index], stream.sample_sequence); index += 4U;
-    write_u64(&payload[index], (uint64_t)sample.timestamp_ms * 1000U); index += 8U;
+    write_u64(&payload[index],
+              (uint64_t)(need_angle ? sample.timestamp_ms : now) * 1000U);
+    index += 8U;
     write_u32(&payload[index], stream.period_us); index += 4U;
     payload[index++] = 1U;
     payload[index++] = stream.channel_count;
@@ -1349,6 +1397,23 @@ void cesc_protocol_periodic(void)
         case CHANNEL_RAW_ANGLE: write_u16(&payload[index], sample.raw); index += 2U; break;
         case CHANNEL_ANGLE_DEGREES: write_float(&payload[index], sample.degrees); index += 4U; break;
         case CHANNEL_SENSOR_STATUS: payload[index++] = (uint8_t)sample.status; break;
+        case CHANNEL_BOARD_TEMPERATURE_RAW:
+            write_u16(&payload[index], diagnostics.board_temperature_raw);
+            index += 2U;
+            break;
+        case CHANNEL_BOARD_TEMPERATURE:
+            write_float(&payload[index],
+                        (float)diagnostics.board_temperature_deci_c * 0.1F);
+            index += 4U;
+            break;
+        case CHANNEL_BOARD_TEMPERATURE_STATUS:
+            payload[index++] = (uint8_t)diagnostics.board_temperature_status;
+            break;
+        case CHANNEL_THERMAL_CURRENT_LIMIT:
+            write_u32(&payload[index],
+                      (uint32_t)diagnostics.thermal_current_limit_ma);
+            index += 4U;
+            break;
         default: return;
         }
     }

@@ -148,7 +148,7 @@ Vbeta  = sin(theta) Vd + cos(theta) Vq
 - `foc_voltage_to_pwm()`：正弦 PWM，三相围绕 ARR/2 变化；
 - `foc_svm_voltage_to_pwm()`：六扇区空间矢量调制。
 
-默认 `high_speed_svm_enabled=0`，所以不能因为函数存在就认为当前固件已在使用 SVM。
+第一阶段默认 `high_speed_svm_enabled=1`；速度电流 FOC 路径会使用 SVM。实机验证仍需结合 `speedCurrentFoc` 诊断标志和运行结果判定。
 
 ## 6. 电角度如何进入 20 kHz 快环
 
@@ -266,4 +266,3 @@ cmake --build --preset Debug
 10. 最后再读参数辨识、观测器和完整协议实现
 
 完成第一遍后，你应该能回答：PWM 何时更新、ADC 何时采样、角度从哪里来、Iq 目标从哪里来、故障如何关断。这五个问题比记住所有函数更重要。
-

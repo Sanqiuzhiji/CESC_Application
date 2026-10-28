@@ -38,6 +38,11 @@ typedef struct {
   uint8_t encoder_invalid_sample_limit;
   uint32_t minimum_bus_voltage_mv;
   uint32_t maximum_bus_voltage_mv;
+  float board_ntc_beta;
+  uint32_t board_ntc_nominal_ohms;
+  uint32_t board_ntc_fixed_ohms;
+  float board_temperature_derate_start_c;
+  float board_temperature_shutdown_c;
 
   float encoder_pll_kp;
   float encoder_pll_ki;

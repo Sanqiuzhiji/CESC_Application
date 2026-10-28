@@ -21,6 +21,20 @@ typedef enum {
   POWER_STAGE_CONTROL_HAPTIC
 } power_stage_control_mode_t;
 
+typedef enum {
+  POWER_STAGE_TEMPERATURE_UNINITIALIZED = 0,
+  POWER_STAGE_TEMPERATURE_OK,
+  POWER_STAGE_TEMPERATURE_NTC_OPEN,
+  POWER_STAGE_TEMPERATURE_NTC_SHORT,
+  POWER_STAGE_TEMPERATURE_INVALID,
+  POWER_STAGE_TEMPERATURE_OVERTEMP
+} power_stage_temperature_status_t;
+
+enum {
+  POWER_STAGE_THERMAL_FAULT_SENSOR = 1U << 0,
+  POWER_STAGE_THERMAL_FAULT_OVERTEMP = 1U << 1
+};
+
 typedef struct {
   uint16_t raw[3];
   int32_t centered[3];
@@ -34,6 +48,11 @@ typedef struct {
   uint16_t drv_faults;
   uint16_t bus_voltage_raw;
   uint32_t bus_voltage_mv;
+  uint16_t board_temperature_raw;
+  int16_t board_temperature_deci_c;
+  power_stage_temperature_status_t board_temperature_status;
+  uint8_t thermal_faults;
+  int32_t thermal_current_limit_ma;
   bool gate_enabled;
   bool pwm_outputs_enabled;
   bool fault_pin_active;
